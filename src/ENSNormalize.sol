@@ -350,20 +350,30 @@ contract ENSNormalize is IENSIP15 {
                 }
                 uint256 c = _lookup(ctx, cp);
                 assembly ("memory-safe") {
-                    mstore(end, or(cp, shl(E_CLASS, c)))
-                    end := add(end, 32)
                     switch xor(and(c, PLAIN), C_VALID)
                     case 0 {
                         // NFC quick check: NFC_QC = Yes and canonical order
-                        c := and(shr(C_RANK_SHIFT, c), 0x7f)
-                        switch c
+                        let r := and(shr(C_RANK_SHIFT, c), 0x7f)
+                        switch r
                         case 0 { state := and(state, S_NFC) }
                         default {
-                            if or(gt(c, 63), lt(c, and(state, 63))) { state := S_NFC }
-                            state := or(and(state, S_NFC), c)
+                            if or(gt(r, 63), lt(r, and(state, 63))) { state := S_NFC }
+                            state := or(and(state, S_NFC), r)
                         }
                     }
-                    default { state := S_TOKENIZE } // an emoji start, mapped, ignored, or disallowed
+                    default {
+                        // not plain text: an emoji start, mapped, ignored, or disallowed
+                        // except an ascii emoji start (a digit): it only starts a keycap, with FE0F or 20E3
+                        let next := shr(232, calldataload(i))
+                        if and(lt(cp, 0x80), iszero(or(eq(next, 0xefb88f), eq(next, 0xe283a3)))) {
+                            c := and(c, not(C_EMOJI))
+                        }
+                        switch xor(and(c, PLAIN), C_VALID)
+                        case 0 { state := and(state, S_NFC) }
+                        default { state := S_TOKENIZE }
+                    }
+                    mstore(end, or(cp, shl(E_CLASS, c)))
+                    end := add(end, 32)
                 }
             }
             // invalid, or truncated
@@ -387,6 +397,15 @@ contract ENSNormalize is IENSIP15 {
                 if (x & E_RAW != 0) {
                     x &= CP_MASK;
                     c = _lookup(ctx, x);
+                    assembly ("memory-safe") {
+                        if lt(x, 0x80) {
+                            if and(c, C_EMOJI) {
+                                // an ascii emoji start (a digit) only starts a keycap: with FE0F or 20E3
+                                let next := and(mload(add(p, 32)), CP_MASK)
+                                if iszero(or(eq(next, FE0F), eq(next, 0x20e3))) { c := and(c, not(C_EMOJI)) }
+                            }
+                        }
+                    }
                     x |= c << E_CLASS;
                 }
                 if (c & PLAIN != C_VALID) {

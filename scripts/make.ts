@@ -69,8 +69,8 @@ const RUN_MAPPED = 0x8000; // run value: mapped, low 15 bits = offset into MAP
 const INDEX_HOT = 0x8000; // index entry: the bucket is in HOT (the contract's code), not RUNS
 // the tables in the contract's code can't exceed this: EIP-170 (24576) minus the contract's logic
 // the hot buckets fill what the other tables leave
-const TABLES_BUDGET = 17100;
-const HOT_EMOJI_WEIGHT = 256; // a hot bucket is ranked by its valid cps, and an emoji start counts as a bucket of them
+const TABLES_BUDGET = 16960;
+const HOT_EMOJI_WEIGHT = 512; // a hot bucket is ranked by its valid cps, and an emoji start counts as 2 buckets of them
 
 const FE0F = 0xfe0f;
 
@@ -184,6 +184,8 @@ type TrieNode = {next: Map<number, TrieNode>; term: boolean};
 const trieRoot: TrieNode = {next: new Map(), term: false};
 for (const emoji of spec.emoji) {
 	assert(!emoji.filter((cp) => cp !== FE0F).every((cp) => cp < 0x80), 'emoji has a non-ascii cp');
+	// the contract only tries an emoji at an ascii cp (a digit) if FE0F or 20E3 follows
+	assert(emoji[0]! >= 0x80 || emoji[1] === FE0F || emoji[1] === 0x20e3, 'an ascii emoji start is a keycap');
 	let nodes = [trieRoot];
 	for (const cp of emoji) {
 		const next = nodes.map((node) => {

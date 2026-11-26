@@ -54,6 +54,7 @@ contract GasTest is Test {
         // latin
         _gas(unicode"latin: café", unicode"café");
         _gas(unicode"latin: cafe + 0301", unicode"café");
+        _gas(unicode"latin: café123", unicode"café123");
         _gas(unicode"latin: a’b", unicode"a’b");
         _gas(unicode"latin: é x 100", _repeat(unicode"é", 100));
         _gas(unicode"latin: e + 0301 x 100", _repeat(unicode"e\u0301", 100));
@@ -63,6 +64,8 @@ contract GasTest is Test {
         _gas(unicode"emoji: 🏳️‍🌈", unicode"🏳️‍🌈");
         _gas(unicode"emoji: 💩💩💩", unicode"💩💩💩");
         _gas(unicode"emoji: 123💩", unicode"123💩");
+        _gas(unicode"emoji: 💩123", unicode"💩123");
+        _gas(unicode"emoji: 1️⃣", unicode"1️⃣");
         _gas(unicode"emoji: abc💩def", unicode"abc💩def");
         _gas(unicode"emoji: 💩 x 100", _repeat(unicode"💩", 100));
         // mapped
