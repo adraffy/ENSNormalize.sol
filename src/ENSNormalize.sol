@@ -5,10 +5,12 @@ import {IENSIP15} from "./IENSIP15.sol";
 import {
     SPEC_HASH,
     LIMIT,
+    IGNORED_CLASS,
     IGNORED_LO,
     IGNORED_HI,
     ASCII_VALID,
     CHECK_NSM,
+    DIRECT_OFFSET,
     INDEX_OFFSET,
     HOT_OFFSET,
     CLASSES_OFFSET,
@@ -64,6 +66,7 @@ contract ENSNormalize is IENSIP15 {
     uint256 private constant C_EMOJI_SHIFT = 20; // 6 bits
     uint256 private constant C_EMOJI = 63 << 20;
     uint256 private constant C_VALID = 1 << 26;
+    uint256 private constant PLAIN = (1 << 31) | (63 << 20) | (1 << 26); // == C_VALID: valid, and not an emoji start
     uint256 private constant C_IGNORED = 1 << 27;
     /// @dev _lookup(): the cp is mapped, the low 15 bits are its offset in MAP.
     uint256 private constant MAPPED = 1 << 31;
@@ -79,24 +82,26 @@ contract ENSNormalize is IENSIP15 {
     uint256 private constant E_UNIQUE = 1 << 42;
     uint256 private constant E_DECOMP = 1 << 43;
     uint256 private constant E_FENCED = 1 << 52;
+    uint256 private constant E_UNDERSCORE = 1 << 53;
     uint256 private constant E_ID = 56; // 16 bits
     uint256 private constant E_EMOJI = 1 << 255; // part of an emoji
     uint256 private constant E_COMPOSED = 1 << 254; // class must be looked up again
+    uint256 private constant E_RAW = 1 << 253; // _classify(): not looked up
 
-    // _tokenize()
     uint256 private constant F_CHANGED = 1; // the output isn't the input
-    uint256 private constant NF_NEEDED = 0x100; // the run isn't NFC (low bits: rank of the last cp)
+    // state of a text run: the rank of its last cp, and
+    uint256 private constant S_NFC = 0x100; // it isn't NFC
+    uint256 private constant S_TOKENIZE = 0x200; // _classify(): a cp isn't plain text
 
     // context
-    // 2 slots of 0x80: bucket 0 (ascii), any other bucket
-    uint256 private constant SLOT_BUCKET = 0x00; // bucket + 1
-    uint256 private constant SLOT_STARTS = 0x20; // pointer to its starts
-    uint256 private constant SLOT_INDEX = 0x40; // its index entry + 1: buckets can share one
-    uint256 private constant CTX_TABLES = 0x100; // offset of TABLES in this contract's code
-    uint256 private constant CTX_MASK = 0x120; // 4 x [mask id + 1][mask]
-    uint256 private constant CTX_BUCKET = 0x220; // 2 x BUCKET_AREA, then EMOJI_NODE_SIZE + 32 of scratch
-    uint256 private constant BUCKET_AREA = BUCKET_SIZE + 32;
-    uint256 private constant CTX_SIZE = CTX_BUCKET + 2 * BUCKET_AREA + EMOJI_NODE_SIZE + 32;
+    uint256 private constant CTX_BUCKET_ID = 0x00; // the cached bucket + 1
+    uint256 private constant CTX_STARTS = 0x20; // pointer to its starts
+    uint256 private constant CTX_INDEX = 0x40; // its index entry + 1: buckets can share one
+    uint256 private constant CTX_MASK = 0x60; // 4 x [mask id + 1][mask]
+    uint256 private constant CTX_TABLES = 0x160; // offset of TABLES in this contract's code
+    uint256 private constant CTX_BUCKET = 0x180; // BUCKET_SIZE + 32, then EMOJI_NODE_SIZE + 32 of scratch
+    uint256 private constant CTX_SCRATCH = CTX_BUCKET + BUCKET_SIZE + 32;
+    uint256 private constant CTX_SIZE = CTX_SCRATCH + EMOJI_NODE_SIZE + 32;
 
     uint256 private constant UNDERSCORE = 0x5f;
     uint256 private constant HYPHEN = 0x2d;
@@ -165,12 +170,25 @@ contract ENSNormalize is IENSIP15 {
     /// @inheritdoc IENSIP15
     function normalize(string calldata label) external view returns (string memory) {
         if (!_normalizeASCII(label)) {
-            uint256 ctx = _context();
-            uint256 cps = ctx + CTX_SIZE;
-            uint256 end = _decodeUTF8(label, cps);
-            if (end != cps) {
-                (uint256 top, uint256 flags) = _tokenize(ctx, cps, end);
-                if (top != end && _isValid(ctx, end, top)) _return(label, end, top, flags);
+            // unchecked: a constant that's an expression is evaluated where it's used, with overflow checks
+            unchecked {
+                uint256 ctx = _context();
+                uint256 buf = ctx + CTX_SIZE;
+                (uint256 top, uint256 state) = _classify(ctx, buf, bytes(label));
+                if (top != buf) {
+                    uint256 flags;
+                    if (state & S_TOKENIZE != 0) {
+                        // the entries are the input: the output goes after it
+                        uint256 cps = buf;
+                        buf = top;
+                        (top, flags) = _tokenize(ctx, cps, buf);
+                    } else if (state & S_NFC != 0) {
+                        // the entries are the output: one text run
+                        top = _nfc(ctx, buf, top);
+                        flags = F_CHANGED;
+                    }
+                    if (top != buf && _isValid(ctx, buf, top)) _return(label, buf, top, flags);
+                }
             }
         }
         revert CannotNormalize(label);
@@ -258,81 +276,130 @@ contract ENSNormalize is IENSIP15 {
     function _context() internal pure returns (uint256 ctx) {
         assembly ("memory-safe") {
             ctx := mload(0x40)
-            calldatacopy(ctx, calldatasize(), CTX_BUCKET) // zero the tags
+            calldatacopy(ctx, calldatasize(), CTX_TABLES) // zero the tags
             // the code ends with [TABLES][metadata][metadata length: 2]
             codecopy(0, sub(codesize(), 2), 2)
             mstore(add(ctx, CTX_TABLES), sub(sub(codesize(), add(shr(240, mload(0)), 2)), TABLES_SIZE))
         }
     }
 
-    /// @dev Decodes UTF-8 into cps. Returns the end, or `cps` if invalid.
-    function _decodeUTF8(string calldata label, uint256 cps) private pure returns (uint256 end) {
+    /// @dev Decodes UTF-8 into entries at `buf`: cp | _lookup() << 24 while every cp is plain text (valid, and
+    ///      not an emoji start), and cp | E_RAW after one that isn't.
+    ///      Returns their end, or `buf` if the UTF-8 is invalid.
+    ///      If every cp is plain text, the entries are the output: one text run, that isn't NFC if `state` has S_NFC.
+    ///      Else `state` is S_TOKENIZE.
+    function _classify(uint256 ctx, uint256 buf, bytes calldata utf8)
+        private
+        view
+        returns (uint256 end, uint256 state)
+    {
+        end = buf;
+        uint256 i;
+        uint256 e;
+        uint256 bad;
         assembly ("memory-safe") {
-            end := cps
-            let i := label.offset
-            for { let e := add(i, label.length) } lt(i, e) {} {
-                let w := calldataload(i)
-                let cp := byte(0, w)
-                switch lt(cp, 0x80)
-                case 1 { i := add(i, 1) }
-                default {
-                    let bad
-                    switch lt(cp, 0xe0)
-                    case 1 {
-                        // 110xxxxx 10xxxxxx
-                        let x := shr(240, w)
-                        bad := or(lt(cp, 0xc2), xor(and(x, 0xc0), 0x80))
-                        cp := or(shl(6, and(cp, 0x1f)), and(x, 0x3f))
-                        i := add(i, 2)
-                    }
+            i := utf8.offset
+            e := add(i, utf8.length)
+            // 4 bytes: likely an emoji, so don't look up here
+            if gt(byte(0, calldataload(i)), 0xef) { state := S_TOKENIZE }
+            // 4 bytes: likely an emoji, so don't look up here
+            if gt(byte(0, calldataload(i)), 0xef) { state := S_TOKENIZE }
+        }
+        unchecked {
+            while (i < e) {
+                uint256 cp;
+                assembly ("memory-safe") {
+                    let w := calldataload(i)
+                    cp := byte(0, w)
+                    switch lt(cp, 0x80)
+                    case 1 { i := add(i, 1) }
                     default {
-                        switch lt(cp, 0xf0)
+                        switch lt(cp, 0xe0)
                         case 1 {
-                            // 1110xxxx 10xxxxxx 10xxxxxx
-                            let x := shr(232, w)
-                            cp := or(shl(12, and(cp, 0x0f)), or(and(shr(2, x), 0xfc0), and(x, 0x3f)))
-                            bad := or(xor(and(x, 0xc0c0), 0x8080), or(lt(cp, 0x800), eq(shr(11, cp), 0x1b)))
-                            i := add(i, 3)
+                            // 110xxxxx 10xxxxxx
+                            w := shr(240, w)
+                            bad := or(bad, or(lt(cp, 0xc2), xor(and(w, 0xc0), 0x80)))
+                            cp := or(shl(6, and(cp, 0x1f)), and(w, 0x3f))
+                            i := add(i, 2)
                         }
                         default {
-                            // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-                            let x := shr(224, w)
-                            bad := or(gt(cp, 0xf4), xor(and(x, 0xc0c0c0), 0x808080))
-                            cp := or(
-                                or(shl(18, and(cp, 0x07)), and(shr(4, x), 0x3f000)),
-                                or(and(shr(2, x), 0xfc0), and(x, 0x3f))
-                            )
-                            bad := or(bad, or(lt(cp, 0x10000), gt(cp, 0x10ffff)))
-                            i := add(i, 4)
+                            switch lt(cp, 0xf0)
+                            case 1 {
+                                // 1110xxxx 10xxxxxx 10xxxxxx
+                                w := shr(232, w)
+                                cp := or(shl(12, and(cp, 0x0f)), or(and(shr(2, w), 0xfc0), and(w, 0x3f)))
+                                bad := or(
+                                    bad,
+                                    or(xor(and(w, 0xc0c0), 0x8080), or(lt(cp, 0x800), eq(shr(11, cp), 0x1b)))
+                                )
+                                i := add(i, 3)
+                            }
+                            default {
+                                // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                                w := shr(224, w)
+                                bad := or(bad, or(gt(cp, 0xf4), xor(and(w, 0xc0c0c0), 0x808080)))
+                                cp := or(
+                                    or(shl(18, and(cp, 0x07)), and(shr(4, w), 0x3f000)),
+                                    or(and(shr(2, w), 0xfc0), and(w, 0x3f))
+                                )
+                                bad := or(bad, or(lt(cp, 0x10000), gt(cp, 0x10ffff)))
+                                i := add(i, 4)
+                            }
                         }
                     }
-                    if or(bad, gt(i, e)) {
-                        end := cps
-                        break
-                    }
                 }
-                mstore(end, cp)
-                end := add(end, 32)
+                if (state & S_TOKENIZE != 0) {
+                    // the rest is looked up by _tokenize(), since the cps inside an emoji aren't
+                    assembly ("memory-safe") {
+                        mstore(end, or(cp, E_RAW))
+                        end := add(end, 32)
+                    }
+                    continue;
+                }
+                uint256 c = _lookup(ctx, cp);
+                assembly ("memory-safe") {
+                    mstore(end, or(cp, shl(E_CLASS, c)))
+                    end := add(end, 32)
+                    switch xor(and(c, PLAIN), C_VALID)
+                    case 0 {
+                        // NFC quick check: NFC_QC = Yes and canonical order
+                        c := and(shr(C_RANK_SHIFT, c), 0x7f)
+                        switch c
+                        case 0 { state := and(state, S_NFC) }
+                        default {
+                            if or(gt(c, 63), lt(c, and(state, 63))) { state := S_NFC }
+                            state := or(and(state, S_NFC), c)
+                        }
+                    }
+                    default { state := S_TOKENIZE } // an emoji start, mapped, ignored, or disallowed
+                }
             }
+            // invalid, or truncated
+            if (bad != 0 || i > e) end = buf;
         }
     }
 
-    /// @dev Writes the output entries at `end`: text runs (NFC) and emoji (without FE0F).
-    ///      Returns their end, or `end` if a cp is disallowed.
+    /// @dev Tokenizes the entries [cps, end) into the output at `end`: text runs (NFC) and emoji (without FE0F).
+    ///      Returns its end, or `end` if a cp is disallowed.
     function _tokenize(uint256 ctx, uint256 cps, uint256 end) private view returns (uint256 top, uint256 flags) {
         top = end;
         uint256 run = end; // start of the current text run
-        uint256 nf; // rank of the last cp, NF_NEEDED if the run isn't NFC
+        uint256 nf; // rank of the last cp, S_NFC if the run isn't NFC
         unchecked {
             for (uint256 p = cps; p < end;) {
-                uint256 cp;
+                uint256 x;
                 assembly ("memory-safe") {
-                    cp := mload(p)
+                    x := mload(p)
                 }
-                uint256 c = _lookup(ctx, cp);
-                if (c & (MAPPED | C_EMOJI | C_VALID) != C_VALID) {
+                uint256 c = x >> E_CLASS;
+                if (x & E_RAW != 0) {
+                    x &= CP_MASK;
+                    c = _lookup(ctx, x);
+                    x |= c << E_CLASS;
+                }
+                if (c & PLAIN != C_VALID) {
                     if (c & MAPPED != 0) {
-                        (top, nf) = _appendMapped(ctx, top, nf, cp, c & 0x7fff);
+                        (top, nf) = _appendMapped(ctx, top, nf, x & CP_MASK, c & 0x7fff);
                         flags = F_CHANGED;
                         p += 32;
                         continue;
@@ -340,17 +407,17 @@ contract ENSNormalize is IENSIP15 {
                     if (c & C_EMOJI != 0) {
                         uint256 q = _matchEmoji(ctx, p, end, (c >> C_EMOJI_SHIFT) & 63);
                         if (q != 0) {
-                            if (nf & NF_NEEDED != 0) {
+                            if (nf & S_NFC != 0) {
                                 top = _nfc(ctx, run, top);
                                 flags = F_CHANGED;
                             }
                             assembly ("memory-safe") {
                                 for {} lt(p, q) { p := add(p, 32) } {
-                                    cp := mload(p)
-                                    switch eq(cp, FE0F)
+                                    x := and(mload(p), CP_MASK)
+                                    switch eq(x, FE0F)
                                     case 1 { flags := F_CHANGED }
                                     default {
-                                        mstore(top, or(cp, E_EMOJI))
+                                        mstore(top, or(x, E_EMOJI))
                                         top := add(top, 32)
                                     }
                                 }
@@ -368,20 +435,20 @@ contract ENSNormalize is IENSIP15 {
                     }
                 }
                 assembly ("memory-safe") {
-                    mstore(top, or(cp, shl(E_CLASS, c)))
+                    mstore(top, x)
                     top := add(top, 32)
                     // NFC quick check: NFC_QC = Yes and canonical order
                     c := and(shr(C_RANK_SHIFT, c), 0x7f)
                     switch c
-                    case 0 { nf := and(nf, NF_NEEDED) }
+                    case 0 { nf := and(nf, S_NFC) }
                     default {
-                        if or(gt(c, 63), lt(c, and(nf, 63))) { nf := NF_NEEDED }
-                        nf := or(and(nf, NF_NEEDED), and(c, 63))
+                        if or(gt(c, 63), lt(c, and(nf, 63))) { nf := S_NFC }
+                        nf := or(and(nf, S_NFC), and(c, 63))
                     }
                     p := add(p, 32)
                 }
             }
-            if (nf & NF_NEEDED != 0) {
+            if (nf & S_NFC != 0) {
                 top = _nfc(ctx, run, top);
                 flags = F_CHANGED;
             }
@@ -390,7 +457,10 @@ contract ENSNormalize is IENSIP15 {
 
     /// @dev Returns the end of the longest emoji at `p`, or 0.
     function _matchEmoji(uint256 ctx, uint256 p, uint256 end, uint256 node) private pure returns (uint256 q) {
-        uint256 scratch = ctx + CTX_BUCKET + 2 * BUCKET_AREA;
+        uint256 scratch;
+        unchecked {
+            scratch = ctx + CTX_SCRATCH;
+        }
         assembly ("memory-safe") {
             let emoji := add(mload(add(ctx, CTX_TABLES)), EMOJI_OFFSET)
             for { p := add(p, 32) } 1 { p := add(p, 32) } {
@@ -400,7 +470,7 @@ contract ENSNormalize is IENSIP15 {
                 let hdr := byte(0, mload(scratch))
                 if gt(hdr, 0x7f) { q := p }
                 if eq(p, end) { break }
-                let cp := mload(p)
+                let cp := and(mload(p), CP_MASK)
                 node := 0
                 for {
                     let e := add(scratch, 1)
@@ -446,8 +516,8 @@ contract ENSNormalize is IENSIP15 {
                     mstore(top, or(cp, shl(E_CLASS, c)))
                     top := add(top, 32)
                     c := and(shr(C_RANK_SHIFT, c), 0x7f)
-                    if or(gt(c, 63), and(gt(c, 0), lt(c, and(nf, 63)))) { nf := NF_NEEDED }
-                    nf := or(and(nf, NF_NEEDED), and(c, 63))
+                    if or(gt(c, 63), and(gt(c, 0), lt(c, and(nf, 63)))) { nf := S_NFC }
+                    nf := or(and(nf, S_NFC), and(c, 63))
                 }
             }
         }
@@ -461,47 +531,56 @@ contract ENSNormalize is IENSIP15 {
     function _lookup(uint256 ctx, uint256 cp) internal view returns (uint256 v) {
         address runs = _runs;
         assembly ("memory-safe") {
-            switch lt(cp, LIMIT)
-            case 0 { v := mul(C_IGNORED, and(gt(cp, sub(IGNORED_LO, 1)), lt(cp, add(IGNORED_HI, 1)))) }
-            default {
-                // the bucket of cp >> 8, cached: bucket 0 (ascii) has its own slot
-                // bucket: [n - 1][sub: 8][values: 2n][starts - 1: n - 1]
-                let b := shr(8, cp)
-                let slot := gt(b, 0)
-                let p := add(ctx, add(CTX_BUCKET, mul(slot, add(BUCKET_SIZE, 32))))
-                slot := add(ctx, shl(7, slot))
-                if iszero(eq(mload(slot), add(b, 1))) {
-                    mstore(slot, add(b, 1))
-                    // index: offset in RUNS, or 0x8000 | offset in HOT
-                    let tables := mload(add(ctx, CTX_TABLES))
-                    codecopy(0, add(add(tables, INDEX_OFFSET), shl(1, b)), 2)
-                    let off := shr(240, mload(0))
-                    if iszero(eq(mload(add(slot, SLOT_INDEX)), add(off, 1))) {
-                        mstore(add(slot, SLOT_INDEX), add(off, 1))
-                        switch and(off, 0x8000)
-                        case 0 { extcodecopy(runs, p, add(RUNS_OFFSET, off), BUCKET_SIZE) }
-                        default { codecopy(p, add(add(tables, HOT_OFFSET), and(off, 0x7fff)), BUCKET_SIZE) }
-                        off := byte(0, mload(p)) // n - 1
-                        tables := add(add(p, 11), shl(1, off)) // starts
-                        mstore(add(tables, off), not(0)) // pad with 0xff: never < lo
-                        mstore(add(slot, SLOT_STARTS), tables)
-                    }
-                }
-                // sub[lo >> 5] is the run that contains the sub-block: add the next 32 starts that are <= lo
-                // in 16-bit lanes, (0xff + lo - (start - 1)) has bit 8 set if start <= lo
-                let lo := and(cp, 0xff)
-                let l := byte(shr(5, lo), mload(add(p, 1)))
-                let w := mload(add(mload(add(slot, SLOT_STARTS)), l))
-                lo := mul(add(0xff, lo), LANES)
-                w := add(and(shr(8, sub(lo, and(w, BYTES))), LANES), and(shr(8, sub(lo, and(shr(8, w), BYTES))), LANES))
-                v := shr(240, mload(add(add(p, 9), shl(1, add(l, shr(240, mul(w, LANES))))))) // values[l + sum of lanes]
-                switch and(v, 0x8000)
-                case 0 {
-                    codecopy(0, add(add(mload(add(ctx, CTX_TABLES)), CLASSES_OFFSET), shl(2, v)), 4)
-                    v := or(shr(224, mload(0)), shl(32, v))
-                }
-                default { v := or(MAPPED, and(v, 0x7fff)) }
+            let tables := mload(add(ctx, CTX_TABLES))
+            // the value of cp: a class id, or 0x8000 | offset in MAP
+            switch lt(cp, 0x100)
+            case 1 {
+                // ascii and Latin-1: direct
+                codecopy(0, add(add(tables, DIRECT_OFFSET), shl(1, cp)), 2)
+                v := shr(240, mload(0))
             }
+            default {
+                switch lt(cp, LIMIT)
+                case 0 { v := mul(IGNORED_CLASS, and(gt(cp, sub(IGNORED_LO, 1)), lt(cp, add(IGNORED_HI, 1)))) }
+                default {
+                    // the bucket of cp >> 8, cached: [n - 1][sub: 8][values: 2n][starts - 1: n - 1]
+                    let b := add(shr(8, cp), 1)
+                    let p := add(ctx, CTX_BUCKET)
+                    if iszero(eq(mload(ctx), b)) {
+                        mstore(ctx, b)
+                        // index: offset in RUNS, or 0x8000 | offset in HOT
+                        codecopy(0, add(add(tables, sub(INDEX_OFFSET, 2)), shl(1, b)), 2)
+                        b := add(shr(240, mload(0)), 1)
+                        if iszero(eq(mload(add(ctx, CTX_INDEX)), b)) {
+                            mstore(add(ctx, CTX_INDEX), b)
+                            switch and(b, 0x8000)
+                            case 0 { extcodecopy(runs, p, add(sub(RUNS_OFFSET, 1), b), BUCKET_SIZE) }
+                            default { codecopy(p, add(add(tables, sub(HOT_OFFSET, 0x8001)), b), BUCKET_SIZE) }
+                            b := byte(0, mload(p)) // n - 1
+                            let s := add(add(p, 11), shl(1, b)) // starts
+                            mstore(add(s, b), not(0)) // pad with 0xff: never < lo
+                            mstore(add(ctx, CTX_STARTS), s)
+                        }
+                    }
+                    // sub[lo >> 5] is the run that contains the sub-block: add the next 32 starts that are <= lo
+                    // in 16-bit lanes, (0xff + lo - (start - 1)) has bit 8 set if start <= lo
+                    let lo := and(cp, 0xff)
+                    let l := byte(shr(5, lo), mload(add(p, 1)))
+                    let w := mload(add(mload(add(ctx, CTX_STARTS)), l))
+                    lo := mul(add(0xff, lo), LANES)
+                    w := add(
+                        and(shr(8, sub(lo, and(w, BYTES))), LANES),
+                        and(shr(8, sub(lo, and(shr(8, w), BYTES))), LANES)
+                    )
+                    v := shr(240, mload(add(add(p, 9), shl(1, add(l, shr(240, mul(w, LANES))))))) // values[l + sum]
+                }
+            }
+            switch and(v, 0x8000)
+            case 0 {
+                codecopy(0, add(add(tables, CLASSES_OFFSET), shl(2, v)), 4)
+                v := or(shr(224, mload(0)), shl(32, v))
+            }
+            default { v := or(MAPPED, and(v, 0x7fff)) }
         }
     }
 
@@ -677,18 +756,10 @@ contract ENSNormalize is IENSIP15 {
 
     function _isValid(uint256 ctx, uint256 buf, uint256 top) private view returns (bool) {
         unchecked {
-            uint256 x;
-            // underscore allowed only at start
-            uint256 lead = buf;
-            for (; lead < top; lead += 32) {
-                assembly ("memory-safe") {
-                    x := mload(lead)
-                }
-                if (x & CP_MASK != UNDERSCORE) break;
-            }
             // combining marks: no CM at the start of a text run (leading, or after an emoji)
             // fenced: not leading, trailing, or adjacent
             // group: the highest priority group that contains every text cp
+            uint256 x;
             uint256 all; // every entry or'd
             uint256 prev = E_EMOJI;
             uint256 g = type(uint256).max;
@@ -697,19 +768,21 @@ contract ENSNormalize is IENSIP15 {
                 assembly ("memory-safe") {
                     x := mload(p)
                 }
-                if (x & CP_MASK == UNDERSCORE && p > lead) return false;
                 all |= x;
-                if (x & E_EMOJI == 0) {
-                    if (x & (E_CM | E_FENCED) != 0) {
-                        if (x & E_CM != 0 && prev & E_EMOJI != 0) return false;
-                        if (x & E_FENCED != 0 && (p == buf || p + 32 == top || prev & E_FENCED != 0)) return false;
+                if (x & (E_EMOJI | E_CM | E_FENCED) != 0) {
+                    if (x & E_EMOJI != 0) {
+                        prev = x;
+                        continue;
                     }
-                    uint256 id = ((x >> E_CLASS) & C_MASK) + 1;
-                    if (mask >> 248 != id) mask = _maskAll(ctx, id - 1) | (id << 248);
-                    g &= mask;
+                    if (x & E_CM != 0 && prev & E_EMOJI != 0) return false;
+                    if (x & E_FENCED != 0 && (p == buf || p + 32 == top || prev & E_FENCED != 0)) return false;
                 }
+                prev = ((x >> E_CLASS) & C_MASK) + 1;
+                if (mask >> 248 != prev) mask = _maskAll(ctx, prev - 1) | (prev << 248);
+                g &= mask;
                 prev = x;
             }
+            if (all & E_UNDERSCORE != 0 && !_checkUnderscore(buf, top)) return false;
             if (all & (E_EMOJI | 0xffff80) == 0) {
                 // ascii: invalid label extension
                 if (top - buf < 128) return true;
@@ -728,6 +801,17 @@ contract ENSNormalize is IENSIP15 {
             }
             // whole-script confusable: every cp could be a lookalike from one other group
             return all & E_UNIQUE != 0 || all & E_CONFUSED == 0 || _checkWhole(ctx, buf, top);
+        }
+    }
+
+    /// @dev Underscore allowed only at start.
+    function _checkUnderscore(uint256 buf, uint256 top) private pure returns (bool ok) {
+        assembly ("memory-safe") {
+            for {} and(lt(buf, top), eq(and(mload(buf), CP_MASK), UNDERSCORE)) { buf := add(buf, 32) } {}
+            ok := 1
+            for {} lt(buf, top) { buf := add(buf, 32) } {
+                if eq(and(mload(buf), CP_MASK), UNDERSCORE) { ok := 0 }
+            }
         }
     }
 
@@ -810,7 +894,9 @@ contract ENSNormalize is IENSIP15 {
             if eq(mload(slot), add(id, 1)) { mask := mload(add(slot, 32)) }
         }
         if (mask == 0) {
-            mask = _list(ctx, _table(ctx, MASKS_OFFSET + (id << 2), 2));
+            unchecked {
+                mask = _list(ctx, _table(ctx, MASKS_OFFSET + (id << 2), 2));
+            }
             assembly ("memory-safe") {
                 mstore(slot, add(id, 1))
                 mstore(add(slot, 32), mask)
@@ -820,7 +906,9 @@ contract ENSNormalize is IENSIP15 {
 
     /// @dev The groups that have any cp with this mask id as primary.
     function _maskPri(uint256 ctx, uint256 id) private pure returns (uint256) {
-        return _list(ctx, _table(ctx, MASKS_OFFSET + (id << 2) + 2, 2));
+        unchecked {
+            return _list(ctx, _table(ctx, MASKS_OFFSET + (id << 2) + 2, 2));
+        }
     }
 
     /// @dev Reads a mask: [n][bit indices: n], or [0xff][bitmap].

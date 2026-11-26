@@ -42,6 +42,7 @@ const BUCKET_BITS = 8;
 const BUCKET_SIZE = 1 << BUCKET_BITS;
 const SUB_SIZE = 32; // cps per sub-index entry: a word of starts
 const SUB_COUNT = BUCKET_SIZE / SUB_SIZE;
+const DIRECT_LIMIT = 0x100; // cps below this are looked up directly
 const MAX_CONTRACT = 24576 - 1; // EIP-170, minus the leading STOP
 
 // class record bits
@@ -57,13 +58,14 @@ const C_EMOJI = 20; // 6 bits: emoji DAWG node after this cp (0 = not an emoji s
 const C_VALID = 1 << 26;
 const C_IGNORED = 1 << 27;
 const C_FENCED = 1 << 28;
+const C_UNDERSCORE = 1 << 29; // the underscore: its rule is only checked if there is one
 
 const RUN_MAPPED = 0x8000; // run value: mapped, low 15 bits = offset into MAP
 const INDEX_HOT = 0x8000; // index entry: the bucket is in HOT (the contract's code), not RUNS
 // the tables in the contract's code can't exceed this: EIP-170 (24576) minus the contract's logic
 // the hot buckets fill what the other tables leave
 const TABLES_BUDGET = 17100;
-const HOT_EMOJI_WEIGHT = 100; // a hot bucket is ranked by its valid cps, and an emoji start counts as this many
+const HOT_EMOJI_WEIGHT = 256; // a hot bucket is ranked by its valid cps, and an emoji start counts as a bucket of them
 
 const FE0F = 0xfe0f;
 
@@ -295,6 +297,7 @@ function classRecord(cp: number): number {
 		if (cm.has(cp)) r |= C_CM;
 		if (nsm.has(cp)) r |= C_NSM;
 		if (fenced.has(cp)) r |= C_FENCED;
+		if (cp === 0x5f) r |= C_UNDERSCORE;
 		if (confused.has(cp)) r |= C_CONFUSED;
 		else if (popcount(all) === 1) r |= C_UNIQUE;
 	} else if (ignored.has(cp)) {
@@ -403,18 +406,23 @@ function runValue(cp: number): number {
 	return off === undefined ? classIds.get(classKey(cp))! : RUN_MAPPED | off;
 }
 runValue(0x10ffff); // class 0 = disallowed
-// hot buckets go in the contract's own code, so a label of only those reads no data contract:
-// ascii, then the buckets with the most valid cps and emoji starts per byte (Han and Hangul are a few bytes)
+// cps below DIRECT_LIMIT (ascii and Latin-1) have their own table of values, in the contract's code
+// hot buckets go there too, so a label of only those reads no data contract:
+// the buckets with the most valid cps (of unrestricted groups) and emoji starts per byte (Han and Hangul are a few bytes)
+const unrestricted = groups.reduce((a, g, i) => (g.restricted ? a : a | (1n << BigInt(i))), 0n);
 const index = new Bytes();
 const runs = new Bytes();
 const hot = new Bytes();
 const buckets: {key: string; bytes: Uint8Array; score: number}[] = [];
+let hotBuckets = ''; // for the log: the best buckets (and how many share it), ! = didn't fit
 let runCount = 0;
 let maxRuns = 0;
-for (let b = 0; b < LIMIT >> BUCKET_BITS; b++) {
+const direct = new Bytes();
+for (let cp = 0; cp < DIRECT_LIMIT; cp++) direct.u16(runValue(cp));
+for (let b = DIRECT_LIMIT >> BUCKET_BITS; b < LIMIT >> BUCKET_BITS; b++) {
 	const starts: number[] = [];
 	const values: number[] = [];
-	let score = b ? 0 : Infinity;
+	let score = 0;
 	for (let i = 0; i < BUCKET_SIZE; i++) {
 		const cp = (b << BUCKET_BITS) | i;
 		const v = runValue(cp);
@@ -422,7 +430,7 @@ for (let b = 0; b < LIMIT >> BUCKET_BITS; b++) {
 			starts.push(i);
 			values.push(v);
 		}
-		if (maskAll.has(cp)) score++;
+		if ((maskAll.get(cp) ?? 0n) & unrestricted) score++;
 		if (emojiRoot.has(cp)) score += HOT_EMOJI_WEIGHT;
 	}
 	const bytes = new Bytes().u8(starts.length - 1);
@@ -441,11 +449,19 @@ function fillBuckets(budget: number) {
 		else scores.set(key, {bytes, score});
 	}
 	const offsets = new Map<string, number>();
+	const ranked: string[] = [];
 	for (const [key, {bytes}] of [...scores].sort((a, b) => b[1].score / b[1].bytes.length - a[1].score / a[1].bytes.length)) {
-		if (hot.length + bytes.length > budget) continue;
+		const fits = hot.length + bytes.length <= budget;
+		if (ranked.length < 48) {
+			const v = buckets.flatMap((x, i) => (x.key === key ? [(i + (DIRECT_LIMIT >> BUCKET_BITS)).toString(16)] : []));
+			ranked.push(`${fits ? '' : '!'}${v[0]}${v.length > 1 ? `x${v.length}` : ''}`);
+		}
+		if (!fits) continue;
 		offsets.set(key, INDEX_HOT | hot.length);
 		hot.bytes(bytes);
 	}
+	hotBuckets = ranked.join(' ');
+	for (let b = 0; b < DIRECT_LIMIT >> BUCKET_BITS; b++) index.u16(0); // unused
 	for (const {key, bytes} of buckets) {
 		let off = offsets.get(key);
 		if (off === undefined) {
@@ -494,10 +510,13 @@ for (let cp = 0x1161; cp < 0x11c3; cp++) {
 // the hot tables go in ENSNormalize's own code (CODECOPY: no account access)
 // the rest is packed into data contracts (EXTCODECOPY), most used first
 
-fillBuckets(TABLES_BUDGET - (2 * buckets.length + classes.length + emoji.length + masks.length + lists.length));
+fillBuckets(TABLES_BUDGET - (2 * (LIMIT >> BUCKET_BITS) + direct.length + classes.length + emoji.length + masks.length + lists.length));
+const IGNORED_CLASS = classIds.get(String(C_IGNORED))!; // ignored, and nothing else
+assert(IGNORED_CLASS, 'there is a plain ignored class');
 
 type Section = {name: string; data: Uint8Array};
 const tableSections: Section[] = [
+	{name: 'DIRECT', data: direct.toBytes()},
 	{name: 'INDEX', data: index.toBytes()},
 	{name: 'HOT', data: hot.toBytes()},
 	{name: 'CLASSES', data: classes.toBytes()},
@@ -544,6 +563,7 @@ const rd = (b: Uint8Array, off: number, n: number) => {
 };
 function lookupRun(cp: number): number {
 	if (cp >= LIMIT) return -1;
+	if (cp < DIRECT_LIMIT) return rd(view('DIRECT'), cp * 2, 2);
 	let off = rd(view('INDEX'), (cp >> BUCKET_BITS) * 2, 2);
 	const r = view(off & INDEX_HOT ? 'HOT' : 'RUNS');
 	off &= ~INDEX_HOT;
@@ -572,7 +592,13 @@ function readList(off: number): bigint {
 		const v = lookupRun(cp);
 		// what the contract's _lookup() returns: test/Lookup.t.sol checks every cp against LOOKUP_HASH
 		lookups.push(
-			v < 0 ? (ignored.has(cp) ? C_IGNORED : 0) : v & RUN_MAPPED ? 0x80000000 + (v & ~RUN_MAPPED) : rd(view('CLASSES'), v * 4, 4) + v * 2 ** 32,
+			v < 0
+				? ignored.has(cp)
+					? C_IGNORED + IGNORED_CLASS * 2 ** 32
+					: 0
+				: v & RUN_MAPPED
+					? 0x80000000 + (v & ~RUN_MAPPED)
+					: rd(view('CLASSES'), v * 4, 4) + v * 2 ** 32,
 		);
 		if (v < 0) {
 			assert(!valid.has(cp) && !mapped.has(cp) && !emojiRoot.has(cp), `${hex(cp)} above LIMIT`);
@@ -663,8 +689,9 @@ pragma solidity ^0.8.24;
 /// @dev sha256(spec.json)
 bytes32 constant SPEC_HASH = 0x${new Bun.CryptoHasher('sha256').update(specBytes).digest('hex')};
 
-/// @dev Codepoints at or above LIMIT are disallowed, except IGNORED_LO..IGNORED_HI.
+/// @dev Codepoints at or above LIMIT are disallowed, except IGNORED_LO..IGNORED_HI (class IGNORED_CLASS).
 uint256 constant LIMIT = 0x${hex(LIMIT)};
+uint256 constant IGNORED_CLASS = ${IGNORED_CLASS};
 uint256 constant IGNORED_LO = 0x${hex(IGNORED_HI[0]!)};
 uint256 constant IGNORED_HI = 0x${hex(IGNORED_HI[IGNORED_HI.length - 1]!)};
 
@@ -738,4 +765,5 @@ for (const s of sections) {
 	console.log(`${s.name.padEnd(8)} ${String(s.data.length).padStart(6)}  ${p.contract < 0 ? 'tables' : `data${p.contract}`}+${p.offset}`);
 }
 console.log(`tables ${tables.length} bytes (in ENSNormalize)`);
+console.log(`hot buckets: ${hotBuckets}`);
 console.log(`data ${codes.reduce((a, c) => a + c.length, 0)} bytes in ${codes.length} contracts: ${codes.map((c) => c.length).join(', ')}`);
