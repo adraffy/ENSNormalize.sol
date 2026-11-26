@@ -4,7 +4,7 @@ pragma solidity ^0.8.24;
 import {Test, console} from "forge-std/Test.sol";
 import {ENSNormalize} from "../src/ENSNormalize.sol";
 import {IENSIP15} from "../src/IENSIP15.sol";
-import {ENSNormalizeDataDeployer, TABLES_HASH, TABLES_SIZE} from "../src/generated/ENSNormalizeData.sol";
+import {ENSNormalizeDataDeployer, TABLES_HASH} from "../src/generated/ENSNormalizeData.sol";
 import {TestsJSON} from "./TestsJSON.sol";
 
 contract ENSNormalizeTest is Test {
@@ -147,17 +147,7 @@ contract ENSNormalizeTest is Test {
         assertFalse(ens.supportsInterface(0xffffffff));
     }
 
-    /// @dev The contract finds its tables from the end of its code: [tables][metadata][metadata length: 2].
-    ///      That holds while the tables are its only data, and the compiler isn't via-IR.
     function test_tables() external view {
-        bytes memory code = address(ens).code;
-        uint256 n = code.length;
-        uint256 start = n - 2 - ((uint256(uint8(code[n - 2])) << 8) | uint8(code[n - 1])) - TABLES_SIZE;
-        bytes32 hash;
-        assembly {
-            hash := keccak256(add(add(code, 32), start), TABLES_SIZE)
-        }
-        assertEq(hash, TABLES_HASH, "tables are before the metadata");
         assertEq(keccak256(ens.tables()), TABLES_HASH, "tables()");
     }
 

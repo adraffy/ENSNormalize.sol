@@ -24,7 +24,7 @@ ens.normalize("a_b"); // reverts CannotNormalize("a_b")
 
 ## Commands
 
-Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh).
+Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh). It compiles with [Solar](https://github.com/paradigmxyz/solar) (`solc = "solar:0.3.0"` in `foundry.toml`, which forge installs). It also compiles with solc (`forge build --use 0.8.38`), at about 15% more gas.
 
 ```sh
 bun install
@@ -42,7 +42,7 @@ forge test --mc GasTest -vv   # gas report, writes snapshots/
   Forge's JSON cheatcodes coerce strings that look like numbers or hex and reject lone surrogates, so `test/TestsJSON.sol` is a small JSON parser for this file. A lone surrogate becomes U+FFFD, like `TextEncoder`.
   The tests are split into 8 shards so forge runs them in parallel (about 45s).
 - **Every codepoint:** `test/Lookup.t.sol` hashes the contract's lookup of all 1,114,112 codepoints and compares it with the hash that `scripts/make.ts` computed from the spec.
-- **Tables:** `test_tables` checks that the tables are where the contract reads them in its own code.
+- **Tables:** `test/Lookup.t.sol` also checks that the tables are where the contract reads them in its own code.
 
 ## Gas
 
@@ -50,32 +50,32 @@ From `forge test --mc GasTest -vv` (`snapshots/normalize.json`): the gas of the 
 
 | label | gas | data contracts read |
 |---|--:|---|
-| `nick`, `vitalik-buterin` | 876 | |
-| 40 hex characters | 1,097 | |
-| `a` x 255 | 2,423 | |
-| `RaFFY` | 1,708 | |
-| `_dnslink` | 1,862 | |
-| `💩` | 4,084 | |
-| `🚴‍♂️` | 7,731 | |
-| `1️⃣` | 5,544 | |
-| `abc💩def` | 10,474 | |
-| `café` | 6,058 | |
-| `café123` | 9,349 | |
-| `cafe` + U+0301 (NFC) | 15,334 | data0 |
-| `日本語` | 6,324 | |
-| `한국어` | 6,158 | |
-| `привет` | 11,012 | data0 |
-| `ελληνικά` | 12,901 | data0 |
-| `عربي` | 9,227 | data0 |
-| `नमस्ते` | 15,794 | data0 |
-| `ＢＩＴＣＯＩＮ` | 24,247 | data0, data1 |
+| `nick`, `vitalik-buterin` | 697 | |
+| 40 hex characters | 918 | |
+| `a` x 255 | 2,244 | |
+| `RaFFY` | 1,526 | |
+| `_dnslink` | 1,765 | |
+| `💩` | 3,375 | |
+| `🚴‍♂️` | 6,517 | |
+| `1️⃣` | 4,645 | |
+| `abc💩def` | 8,870 | |
+| `café` | 5,020 | |
+| `café123` | 7,779 | |
+| `cafe` + U+0301 (NFC) | 13,365 | data0 |
+| `日本語` | 5,475 | |
+| `한국어` | 5,342 | |
+| `привет` | 9,870 | data0 |
+| `ελληνικά` | 11,540 | data0 |
+| `عربي` | 8,250 | data0 |
+| `नमस्ते` | 13,830 | data0 |
+| `ＢＩＴＣＯＩＮ` | 21,554 | data0, data1 |
 
 - **ASCII:** a label of only `a-z0-9-` is checked 32 bytes at a time and returned as-is. Other valid ascii and `A-Z` is one loop. Neither reads a table.
 - **No data contract:** ascii and Latin-1, the buckets where most emoji start, Han, and Hangul are in `ENSNormalize`'s own code, with the class records, emoji, and group masks. A label of only those reads no other contract.
 - **data0** has the other buckets, whole-script confusables, and NFC. **data1** has the mappings (only mapped characters read it).
-- There's no length limit. Text costs about 830 per codepoint (`é` x 100 is 83,195), emoji about 2,000 (`💩` x 100 is 198,674), and text that isn't NFC about 5,000 per composition (`e` + U+0301 x 100 is 495,051).
+- There's no length limit. Text costs about 710 per codepoint (`é` x 100 is 71,145), emoji about 1,800 (`💩` x 100 is 181,247), and text that isn't NFC about 4,300 per composition (`e` + U+0301 x 100 is 427,555).
 
-Deploying is about 12.4M gas (`snapshots/deploy.json`): `ENSNormalizeData0` (4.9M), `ENSNormalizeData1` (2.2M), then `ENSNormalize` with their addresses (5.3M), each in its own transaction (under the EIP-7825 cap of 16.7M). `ENSNormalizeDataDeployer.deploy()` deploys the data contracts from a forge script.
+Deploying is about 12.3M gas (`snapshots/deploy.json`): `ENSNormalizeData0` (4.9M), `ENSNormalizeData1` (2.2M), then `ENSNormalize` with their addresses (5.1M), each in its own transaction (under the EIP-7825 cap of 16.7M). `ENSNormalizeDataDeployer.deploy()` deploys the data contracts from a forge script.
 
 ## How it works
 
@@ -98,8 +98,8 @@ Steps 2-6 don't allocate: the context (caches), the codepoints, and the output e
 `scripts/make.ts` derives the tables, replays every lookup through the encoded bytes, and writes `src/generated/ENSNormalizeData.sol`: the constants, `TABLES`, and the data contracts (each starts with STOP).
 Every table is random access, since the contract can't decode a compressed stream on every call.
 
-`TABLES` (16,997 bytes) is a literal in `ENSNormalize`, returned by `tables()`. It's the only data in the contract's code, so solc puts it right before the metadata, and the contract reads it with `CODECOPY` at `codesize() - metadata - TABLES_SIZE`. Reading its own code has no account access cost (a data contract is 2600 for the first read, then 100).
-That placement isn't guaranteed by the compiler: `test_tables` checks it, and it doesn't hold with via-IR.
+`TABLES` (16,997 bytes) is a literal in `ENSNormalize`, returned by `tables()`, and the contract reads it with `CODECOPY`. Reading its own code has no account access cost (a data contract is 2600 for the first read, then 100).
+Where a compiler puts the literal isn't specified (solc puts it right before the metadata, Solar adds padding), so the constructor finds it: the runtime code is at the end of the initcode, before the arguments, so it looks for the last 32 bytes of `TABLES` there, checks its hash, and keeps how far it starts from the end of the code in an immutable.
 
 | section | in | bytes | what |
 |---|---|--:|---|
