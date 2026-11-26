@@ -60,7 +60,10 @@ const C_FENCED = 1 << 28;
 
 const RUN_MAPPED = 0x8000; // run value: mapped, low 15 bits = offset into MAP
 const INDEX_HOT = 0x8000; // index entry: the bucket is in HOT (the contract's code), not RUNS
-const HOT_BUDGET = 2048;
+// the tables in the contract's code can't exceed this: EIP-170 (24576) minus the contract's logic
+// the hot buckets fill what the other tables leave
+const TABLES_BUDGET = 17100;
+const HOT_EMOJI_WEIGHT = 100; // a hot bucket is ranked by its valid cps, and an emoji start counts as this many
 
 const FE0F = 0xfe0f;
 
@@ -360,7 +363,8 @@ const mapOf = new Map<number, number>(); // cp => offset
 
 // ************************************************************
 // runs: per bucket of 256 cps, sorted (start, value) runs; identical buckets are shared
-// bucket: [n - 1][sub: 8][starts: n][values: 2n], sub[k] = the run that contains cp 32k of the bucket
+// bucket: [n - 1][sub: 8][values: 2n][starts - 1: n - 1]
+// sub[k] = the run that contains cp 32k of the bucket, and the first start (0) isn't stored
 
 // a confused cp's class is also keyed by its whole, and those classes are numbered last:
 // CONF[class id - CONF_CLASS] is its (union, extent)
@@ -399,38 +403,46 @@ function runValue(cp: number): number {
 	return off === undefined ? classIds.get(classKey(cp))! : RUN_MAPPED | off;
 }
 runValue(0x10ffff); // class 0 = disallowed
-// hot buckets (ascii, and where the most emoji start) go in the contract's own code, up to HOT_BUDGET bytes:
-// a label of only those reads no data contract
+// hot buckets go in the contract's own code, so a label of only those reads no data contract:
+// ascii, then the buckets with the most valid cps and emoji starts per byte (Han and Hangul are a few bytes)
 const index = new Bytes();
 const runs = new Bytes();
 const hot = new Bytes();
+const buckets: {key: string; bytes: Uint8Array; score: number}[] = [];
 let runCount = 0;
 let maxRuns = 0;
-{
-	const buckets: {key: string; bytes: Uint8Array}[] = [];
-	for (let b = 0; b < LIMIT >> BUCKET_BITS; b++) {
-		const starts: number[] = [];
-		const values: number[] = [];
-		for (let i = 0; i < BUCKET_SIZE; i++) {
-			const v = runValue((b << BUCKET_BITS) | i);
-			if (!i || values[values.length - 1] !== v) {
-				starts.push(i);
-				values.push(v);
-			}
+for (let b = 0; b < LIMIT >> BUCKET_BITS; b++) {
+	const starts: number[] = [];
+	const values: number[] = [];
+	let score = b ? 0 : Infinity;
+	for (let i = 0; i < BUCKET_SIZE; i++) {
+		const cp = (b << BUCKET_BITS) | i;
+		const v = runValue(cp);
+		if (!i || values[values.length - 1] !== v) {
+			starts.push(i);
+			values.push(v);
 		}
-		const bytes = new Bytes().u8(starts.length - 1);
-		for (let k = 0; k < BUCKET_SIZE; k += SUB_SIZE) bytes.u8(starts.findLastIndex((x) => x <= k));
-		for (const x of starts) bytes.u8(x);
-		for (const x of values) bytes.u16(x);
-		buckets.push({key: `${starts}/${values}`, bytes: bytes.toBytes()});
-		maxRuns = Math.max(maxRuns, starts.length);
+		if (maskAll.has(cp)) score++;
+		if (emojiRoot.has(cp)) score += HOT_EMOJI_WEIGHT;
 	}
-	const emojiStarts = new Map<number, number>([[0, Infinity]]);
-	for (const cp of emojiRoot.keys()) emojiStarts.set(cp >> BUCKET_BITS, (emojiStarts.get(cp >> BUCKET_BITS) ?? 0) + 1);
+	const bytes = new Bytes().u8(starts.length - 1);
+	for (let k = 0; k < BUCKET_SIZE; k += SUB_SIZE) bytes.u8(starts.findLastIndex((x) => x <= k));
+	for (const x of values) bytes.u16(x);
+	for (const x of starts.slice(1)) bytes.u8(x - 1);
+	buckets.push({key: `${starts}/${values}`, bytes: bytes.toBytes(), score});
+	maxRuns = Math.max(maxRuns, starts.length);
+}
+// the hot buckets are chosen after the other tables are built: see fillBuckets()
+function fillBuckets(budget: number) {
+	const scores = new Map<string, {bytes: Uint8Array; score: number}>(); // identical buckets are shared
+	for (const {key, bytes, score} of buckets) {
+		const x = scores.get(key);
+		if (x) x.score += score;
+		else scores.set(key, {bytes, score});
+	}
 	const offsets = new Map<string, number>();
-	for (const [b] of [...emojiStarts].sort((x, y) => y[1] - x[1] || x[0] - y[0])) {
-		const {key, bytes} = buckets[b]!;
-		if (offsets.has(key) || hot.length + bytes.length > HOT_BUDGET) continue;
+	for (const [key, {bytes}] of [...scores].sort((a, b) => b[1].score / b[1].bytes.length - a[1].score / a[1].bytes.length)) {
+		if (hot.length + bytes.length > budget) continue;
 		offsets.set(key, INDEX_HOT | hot.length);
 		hot.bytes(bytes);
 	}
@@ -443,10 +455,10 @@ let maxRuns = 0;
 		index.u16(off);
 	}
 	runCount = [...offsets.keys()].reduce((a, key) => a + key.split('/')[0]!.split(',').length, 0);
-	assert(classIds.size < RUN_MAPPED, 'class ids fit in 15 bits');
-	assert(maskIds.size <= 256, 'mask ids fit in a byte');
 	assert(runs.length < INDEX_HOT, 'RUNS offsets fit in 15 bits');
 }
+assert(classIds.size < RUN_MAPPED, 'class ids fit in 15 bits');
+assert(maskIds.size <= 256, 'mask ids fit in a byte');
 
 // ************************************************************
 // remaining tables
@@ -481,6 +493,8 @@ for (let cp = 0x1161; cp < 0x11c3; cp++) {
 // ************************************************************
 // the hot tables go in ENSNormalize's own code (CODECOPY: no account access)
 // the rest is packed into data contracts (EXTCODECOPY), most used first
+
+fillBuckets(TABLES_BUDGET - (2 * buckets.length + classes.length + emoji.length + masks.length + lists.length));
 
 type Section = {name: string; data: Uint8Array};
 const tableSections: Section[] = [
@@ -535,12 +549,14 @@ function lookupRun(cp: number): number {
 	off &= ~INDEX_HOT;
 	const n = r[off]! + 1;
 	const lo = cp & (BUCKET_SIZE - 1);
-	const starts = off + 1 + SUB_COUNT;
+	const values = off + 1 + SUB_COUNT;
+	const starts = values + 2 * n; // starts[i] is of run i + 1, minus 1
 	// the run that contains the sub-block, plus the next 32 starts that are <= lo
 	let i = r[off + 1 + Math.floor(lo / SUB_SIZE)]!;
-	for (let j = 0; j < SUB_SIZE && i + 1 < n && r[starts + i + 1]! <= lo; j++) i++;
-	return rd(r, starts + n + i * 2, 2);
+	for (let j = 0; j < SUB_SIZE && i + 1 < n && r[starts + i]! < lo; j++) i++;
+	return rd(r, values + i * 2, 2);
 }
+const lookups: number[] = [];
 function readList(off: number): bigint {
 	const l = view('LISTS');
 	let m = 0n;
@@ -554,6 +570,10 @@ function readList(off: number): bigint {
 {
 	for (let cp = 0; cp < 0x110000; cp++) {
 		const v = lookupRun(cp);
+		// what the contract's _lookup() returns: test/Lookup.t.sol checks every cp against LOOKUP_HASH
+		lookups.push(
+			v < 0 ? (ignored.has(cp) ? C_IGNORED : 0) : v & RUN_MAPPED ? 0x80000000 + (v & ~RUN_MAPPED) : rd(view('CLASSES'), v * 4, 4) + v * 2 ** 32,
+		);
 		if (v < 0) {
 			assert(!valid.has(cp) && !mapped.has(cp) && !emojiRoot.has(cp), `${hex(cp)} above LIMIT`);
 			continue;
@@ -617,6 +637,13 @@ for (const cp of [0x2d, 0x5f, ...Array(26).keys().map((i) => 0x61 + i), ...Array
 }
 for (let cp = 0; cp < 0x80; cp++) assert(!ignored.has(cp), 'no ascii ignored');
 
+let lookupHash = `0x${'0'.repeat(64)}`;
+for (let i = 0; i < lookups.length; i += 256) {
+	const chunk = new Bytes().bytes(Buffer.from(lookupHash.slice(2), 'hex'));
+	for (const x of lookups.slice(i, i + 256)) chunk.bytes(new Uint8Array(26)).u24(Math.floor(x / 2 ** 24)).u24(x % 2 ** 24);
+	lookupHash = keccak256(chunk.toBytes());
+}
+
 const u256 = (x: bigint) => `0x${x.toString(16).padStart(64, '0')}`;
 const section = ({name}: Section) => {
 	const {contract, offset} = placed.get(name)!;
@@ -655,7 +682,7 @@ uint256 constant COMP_COUNT = ${comp.length / 9};
 /// @dev Class ids from CONF_CLASS are confused: CONF[id - CONF_CLASS].
 uint256 constant CONF_CLASS = ${CONF_CLASS};
 /// @dev The most bytes of a bucket in RUNS, and of a node in EMOJI.
-uint256 constant BUCKET_SIZE = ${1 + SUB_COUNT + 3 * maxRuns};
+uint256 constant BUCKET_SIZE = ${SUB_COUNT + 3 * maxRuns};
 uint256 constant EMOJI_NODE_SIZE = ${emojiNodeSize};
 /// @dev A bitmap in LISTS is its top bytes: shift right by this.
 uint256 constant LIST_BITMAP_SHIFT = ${256 - 8 * GROUP_BYTES};
@@ -667,6 +694,9 @@ function dataHash(uint256 i) pure returns (bytes32) {
 ${codes.map((c, i) => `    if (i == ${i}) return ${keccak256(c)}; // ${c.length} bytes`).join('\n')}
     return 0;
 }
+
+/// @dev keccak256 chain of _lookup() of every codepoint, 256 at a time (as uint256).
+bytes32 constant LOOKUP_HASH = ${lookupHash};
 
 uint256 constant TABLES_SIZE = ${tables.length};
 bytes32 constant TABLES_HASH = ${keccak256(tables)};

@@ -7,8 +7,8 @@ Guidance for AI coding agents working in this repo. See README.md for the design
 ENSIP-15 label normalization in Solidity: `ENSNormalize` implements `IENSIP15` (`normalize(label)` returns the normalized label or reverts `CannotNormalize`). The algorithm follows the reference implementation in [ens-normalize-derive](https://github.com/adraffy/ens-normalize-derive) (`src/ensip15.ts`), and the tables are derived from its spec files (`spec.json`, `nf.json`). The priorities are:
 
 1. **Correctness:** every entry of ens-normalize-derive's `tests.json` must pass (output, or revert when `error` is set).
-2. **Gas:** `normalize()` should stay cheap. Check the gas report for every change to the contract.
-3. **Deploy size:** the tables are deployed as code (about 51 KB in 3 data contracts, about 13M gas). Check the sizes printed by `bun run make` for every change to the encoding.
+2. **Gas:** `normalize()` should stay cheap, and ASCII comes first: most labels are `a-z0-9-`. Check the gas report for every change to the contract.
+3. **Deploy size:** the tables are deployed as code (about 51 KB: 17 KB in `ENSNormalize`, the rest in 2 data contracts; about 12M gas). Check the sizes printed by `bun run make` for every change to the encoding.
 
 The deployment is immutable and ownerless: no admin, no upgrades. A new spec is a new deployment.
 
@@ -20,14 +20,17 @@ Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh).
 bun install
 bun run download          # data/{spec,nf,tests}.json from ens-normalize-derive (main); --force to refetch
 bun run make              # data/*.json => src/generated/ENSNormalizeData.sol, prints section sizes
-forge test                # everything, incl. tests.json (about 40s, 8 parallel shards)
+forge test                # everything, incl. tests.json (about 45s, 8 parallel shards)
 forge test --nmt test_tests          # quick: skip tests.json
-forge test --mc GasTest -vv          # gas report (normalize + deploy)
-forge test --mc LongTest -vv         # long labels
+forge test --mc GasTest -vv          # gas report (normalize + deploy), writes snapshots/
+forge test --mc ProbeTest --flamegraph   # where the gas goes, per internal function (write a throwaway test)
+forge build --sizes       # ENSNormalize must stay under 24,576 bytes
 forge fmt
 ```
 
-Run `bun run make`, `forge fmt --check`, and `forge test` before considering a change done. Report the gas change (GasTest) and, for encoding changes, the size change.
+Run `bun run make`, `forge fmt --check`, and `forge test` before considering a change done. Commit `snapshots/` and report the gas change (`git diff snapshots/`) and, for encoding changes, the size change.
+
+GasTest measures the call itself (not the test's overhead), and forge treats every account as cold on each call: the numbers include 2600 for each data contract a label reads.
 
 ## Layout
 
@@ -35,16 +38,18 @@ Run `bun run make`, `forge fmt --check`, and `forge test` before considering a c
 |---|---|
 | `src/ENSNormalize.sol` | the contract: ascii fast path, UTF-8, tokenize (emoji DAWG, mapped/ignored), NFC, validation |
 | `src/IENSIP15.sol` | interface, copied from ensdomains/contracts-v2 |
-| `src/generated/ENSNormalizeData.sol` | **generated, do not edit:** data contracts, section offsets/counts, codehashes, `ENSNormalizeDataDeployer` |
+| `src/generated/ENSNormalizeData.sol` | **generated, do not edit:** file-level constants (section offsets, counts, hashes), `TABLES`, data contracts, `ENSNormalizeDataDeployer` |
 | `scripts/make.ts` | spec => tables; replays every lookup through the encoded bytes and throws on a mismatch |
 | `scripts/nf.ts` | NFD/NFC from `nf.json` (used by make.ts) |
 | `scripts/utils.ts` | byte writer, keccak (`@adraffy/keccak`) |
 | `scripts/download.ts` | fetches the spec and tests |
-| `test/ENSNormalize.t.sol` | tests.json (sharded), examples, invalid UTF-8, constructor checks |
+| `test/ENSNormalize.t.sol` | tests.json (sharded), examples, invalid UTF-8, constructor checks, `test_tables` |
+| `test/Lookup.t.sol` | the contract's `_lookup()` of every codepoint vs `LOOKUP_HASH` from make.ts |
 | `test/TestsJSON.sol` | minimal JSON parser for tests.json (forge's cheatcodes coerce strings and reject lone surrogates) |
-| `test/Gas.t.sol`, `test/Long.t.sol` | gas reports |
+| `test/Gas.t.sol` | gas report |
+| `snapshots/` | the gas report's output: `normalize.json`, `deploy.json` |
 
-`data/` is downloaded and gitignored. `src/generated/` is committed; CI regenerates it and fails if it changes.
+`data/` is downloaded and gitignored. `src/generated/` and `snapshots/` are committed; CI regenerates the data and fails if it changes.
 
 ## Rules
 
@@ -53,8 +58,13 @@ Run `bun run make`, `forge fmt --check`, and `forge test` before considering a c
 - **Don't edit `src/generated/`** by hand.
 - **Keep parity.** A tests.json failure is a bug. Don't skip or special-case tests; the only conversions are the ones in `test/ENSNormalize.t.sol` (names are split on `.`, `""` is `""`, lone surrogates are U+FFFD).
 - **Assumptions are asserted in make.ts** (eg. no mapped emoji start, decomposable cps aren't mapped, one ignored range above `LIMIT`, groups fit in a `uint256`). If a new spec breaks one, change the encoding and the contract, don't drop the assert.
-- **Data contracts:** each section must fit in one contract (24,575 bytes after the leading STOP), and a deploy transaction must stay under the EIP-7825 cap (16,777,216 gas).
-- **Gas:** hot loops are inline assembly; `_lookup()` caches buckets, class records, and the last mask in a per-call `ctx`. Memory past the free pointer is used as scratch, so don't allocate between filling scratch and reading it. Measure ideas with GasTest before keeping them; `via_ir` was tried and didn't pay for its build time.
+- **Tables in the contract's code.** `TABLES` is a literal that `tables()` returns, and the contract reads it with `CODECOPY` at `codesize() - metadata - TABLES_SIZE` (`_context()`). That works because it's the only data in the runtime code, so solc (legacy codegen) puts it right before the metadata. So:
+  - don't add another literal over 32 bytes to `ENSNormalize` (a revert string, a `bytes`/`string` constant): solc orders data by hash and the tables could move.
+  - don't enable `via_ir`: it lays out data differently (and the code gets bigger).
+  - `test_tables` checks the placement; if it fails, nothing else is trustworthy.
+- **Sizes.** `ENSNormalize` must stay under 24,576 bytes (EIP-170): `TABLES_BUDGET` in make.ts is what's left for the tables after the logic (about 6.8 KB) and the metadata. The hot buckets fill whatever the other tables leave of it, so lower it if the logic grows. Each data section must fit in one contract (24,575 bytes after the leading STOP), and a deploy transaction must stay under the EIP-7825 cap (16,777,216 gas).
+- **Generated constants are file-level** (not in a library), because inline assembly can only use direct number constants. A contract constant that's used in assembly must be a literal expression too (not `X = OTHER_CONSTANT`-style member access).
+- **Gas:** the general path doesn't allocate: `[context][cps][entries][scratch]` are laid out from the free memory pointer, which never moves, and `normalize()` returns from assembly. Don't call anything that allocates there (only the final `revert CannotNormalize(label)` does). `_lookup()` caches two buckets and `_maskAll()` 4 masks in the context. EVM loops cost about 3 gas per opcode and the legacy optimizer doesn't help assembly much, so count operations: an idea is worth it if it removes operations from the per-codepoint paths (`_decodeUTF8`, `_lookup`, the `_tokenize` and `_isValid` loops) or avoids a data contract. Measure with GasTest and the flamegraph before keeping it.
 - **EVM version:** `cancun` (no osaka opcodes), so it deploys on chains that haven't adopted osaka.
 
 ## Working with the maintainer

@@ -88,11 +88,15 @@ contract ENSNormalize is IENSIP15 {
     uint256 private constant NF_NEEDED = 0x100; // the run isn't NFC (low bits: rank of the last cp)
 
     // context
-    uint256 private constant CTX_BUCKET_TAG = 0x00; // 2 x [bucket + 1]: bucket 0 (ascii), any other bucket
-    uint256 private constant CTX_TABLES = 0x40; // offset of TABLES in this contract's code
-    uint256 private constant CTX_MASK = 0x60; // 4 x [mask id + 1][mask]
-    uint256 private constant CTX_BUCKET = 0x160; // 2 x BUCKET_SIZE, then EMOJI_NODE_SIZE + 32 of scratch
-    uint256 private constant CTX_SIZE = CTX_BUCKET + 2 * BUCKET_SIZE + EMOJI_NODE_SIZE + 32;
+    // 2 slots of 0x80: bucket 0 (ascii), any other bucket
+    uint256 private constant SLOT_BUCKET = 0x00; // bucket + 1
+    uint256 private constant SLOT_STARTS = 0x20; // pointer to its starts
+    uint256 private constant SLOT_INDEX = 0x40; // its index entry + 1: buckets can share one
+    uint256 private constant CTX_TABLES = 0x100; // offset of TABLES in this contract's code
+    uint256 private constant CTX_MASK = 0x120; // 4 x [mask id + 1][mask]
+    uint256 private constant CTX_BUCKET = 0x220; // 2 x BUCKET_AREA, then EMOJI_NODE_SIZE + 32 of scratch
+    uint256 private constant BUCKET_AREA = BUCKET_SIZE + 32;
+    uint256 private constant CTX_SIZE = CTX_BUCKET + 2 * BUCKET_AREA + EMOJI_NODE_SIZE + 32;
 
     uint256 private constant UNDERSCORE = 0x5f;
     uint256 private constant HYPHEN = 0x2d;
@@ -202,11 +206,11 @@ contract ENSNormalize is IENSIP15 {
                     v := or(v, and(add(w, DIGIT_LO), not(add(w, DIGIT_HI))))
                     v := or(v, and(add(w, HYPHEN_LO), not(add(w, HYPHEN_HI))))
                     if or(and(w, HIGHS), and(m, not(v))) {
-                        same := 0
+                        same := and(w, HIGHS) // 0, or not ascii
                         break
                     }
                 }
-                if same {
+                if eq(same, 1) {
                     // invalid label extension: ??--
                     if and(gt(n, 3), eq(and(shr(224, calldataload(off)), 0xffff), 0x2d2d)) {
                         bad := 1
@@ -218,6 +222,7 @@ contract ENSNormalize is IENSIP15 {
                     calldatacopy(0x40, off, n)
                     return(0, add(0x40, and(add(n, 31), not(31))))
                 }
+                if same { break} // has other characters
                 // leading underscores, then valid ascii or A-Z
                 let ptr := mload(0x40)
                 let dst := add(ptr, 0x40)
@@ -250,7 +255,7 @@ contract ENSNormalize is IENSIP15 {
     // ************************************************************
     // general
 
-    function _context() private pure returns (uint256 ctx) {
+    function _context() internal pure returns (uint256 ctx) {
         assembly ("memory-safe") {
             ctx := mload(0x40)
             calldatacopy(ctx, calldatasize(), CTX_BUCKET) // zero the tags
@@ -385,7 +390,7 @@ contract ENSNormalize is IENSIP15 {
 
     /// @dev Returns the end of the longest emoji at `p`, or 0.
     function _matchEmoji(uint256 ctx, uint256 p, uint256 end, uint256 node) private pure returns (uint256 q) {
-        uint256 scratch = ctx + CTX_BUCKET + 2 * BUCKET_SIZE;
+        uint256 scratch = ctx + CTX_BUCKET + 2 * BUCKET_AREA;
         assembly ("memory-safe") {
             let emoji := add(mload(add(ctx, CTX_TABLES)), EMOJI_OFFSET)
             for { p := add(p, 32) } 1 { p := add(p, 32) } {
@@ -453,39 +458,43 @@ contract ENSNormalize is IENSIP15 {
     // lookup
 
     /// @dev Returns the class record of `cp` | class id << 32, or MAPPED | offset.
-    function _lookup(uint256 ctx, uint256 cp) private view returns (uint256 v) {
+    function _lookup(uint256 ctx, uint256 cp) internal view returns (uint256 v) {
         address runs = _runs;
         assembly ("memory-safe") {
             switch lt(cp, LIMIT)
             case 0 { v := mul(C_IGNORED, and(gt(cp, sub(IGNORED_LO, 1)), lt(cp, add(IGNORED_HI, 1)))) }
             default {
                 // the bucket of cp >> 8, cached: bucket 0 (ascii) has its own slot
+                // bucket: [n - 1][sub: 8][values: 2n][starts - 1: n - 1]
                 let b := shr(8, cp)
                 let slot := gt(b, 0)
-                let p := add(ctx, add(CTX_BUCKET, mul(slot, BUCKET_SIZE)))
-                slot := add(ctx, shl(5, slot))
+                let p := add(ctx, add(CTX_BUCKET, mul(slot, add(BUCKET_SIZE, 32))))
+                slot := add(ctx, shl(7, slot))
                 if iszero(eq(mload(slot), add(b, 1))) {
+                    mstore(slot, add(b, 1))
                     // index: offset in RUNS, or 0x8000 | offset in HOT
                     let tables := mload(add(ctx, CTX_TABLES))
                     codecopy(0, add(add(tables, INDEX_OFFSET), shl(1, b)), 2)
                     let off := shr(240, mload(0))
-                    switch and(off, 0x8000)
-                    case 0 { extcodecopy(runs, p, add(RUNS_OFFSET, off), BUCKET_SIZE) }
-                    default { codecopy(p, add(add(tables, HOT_OFFSET), and(off, 0x7fff)), BUCKET_SIZE) }
-                    mstore(slot, add(b, 1))
+                    if iszero(eq(mload(add(slot, SLOT_INDEX)), add(off, 1))) {
+                        mstore(add(slot, SLOT_INDEX), add(off, 1))
+                        switch and(off, 0x8000)
+                        case 0 { extcodecopy(runs, p, add(RUNS_OFFSET, off), BUCKET_SIZE) }
+                        default { codecopy(p, add(add(tables, HOT_OFFSET), and(off, 0x7fff)), BUCKET_SIZE) }
+                        off := byte(0, mload(p)) // n - 1
+                        tables := add(add(p, 11), shl(1, off)) // starts
+                        mstore(add(tables, off), not(0)) // pad with 0xff: never < lo
+                        mstore(add(slot, SLOT_STARTS), tables)
+                    }
                 }
-                // bucket: [n - 1][sub: 8][starts: n][values: 2n]
                 // sub[lo >> 5] is the run that contains the sub-block: add the next 32 starts that are <= lo
-                // in 16-bit lanes, (0x100 + lo - start) has bit 8 set if start <= lo
-                let n := add(byte(0, mload(p)), 1)
+                // in 16-bit lanes, (0xff + lo - (start - 1)) has bit 8 set if start <= lo
                 let lo := and(cp, 0xff)
                 let l := byte(shr(5, lo), mload(add(p, 1)))
-                let w := or(mload(add(p, add(10, l))), shr(shl(3, sub(n, add(l, 1))), not(0))) // past the end: 0xff
-                lo := mul(add(0x100, lo), LANES)
+                let w := mload(add(mload(add(slot, SLOT_STARTS)), l))
+                lo := mul(add(0xff, lo), LANES)
                 w := add(and(shr(8, sub(lo, and(w, BYTES))), LANES), and(shr(8, sub(lo, and(shr(8, w), BYTES))), LANES))
-                l := add(l, shr(240, mul(w, LANES))) // sum of lanes
-                if iszero(lt(l, n)) { l := sub(n, 1) } // lo = 0xff counts the padding
-                v := shr(240, mload(add(p, add(add(9, n), shl(1, l))))) // values[l]
+                v := shr(240, mload(add(add(p, 9), shl(1, add(l, shr(240, mul(w, LANES))))))) // values[l + sum of lanes]
                 switch and(v, 0x8000)
                 case 0 {
                     codecopy(0, add(add(mload(add(ctx, CTX_TABLES)), CLASSES_OFFSET), shl(2, v)), 4)
@@ -726,6 +735,7 @@ contract ENSNormalize is IENSIP15 {
     function _checkBase(uint256 ctx, uint256 buf, uint256 top, uint256 g) private pure returns (bool) {
         unchecked {
             uint256 base;
+            uint256 checked = type(uint256).max; // the last base that was primary
             for (; buf < top; buf += 32) {
                 uint256 x;
                 assembly ("memory-safe") {
@@ -734,8 +744,9 @@ contract ENSNormalize is IENSIP15 {
                 if (x & E_EMOJI != 0) continue;
                 if (x & E_CM == 0) {
                     base = (x >> E_CLASS) & C_MASK;
-                } else if (_maskPri(ctx, base) & g == 0) {
-                    return false;
+                } else if (base != checked) {
+                    if (_maskPri(ctx, base) & g == 0) return false;
+                    checked = base;
                 }
             }
         }
