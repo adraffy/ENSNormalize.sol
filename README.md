@@ -57,7 +57,7 @@ From `forge test --mc GasTest -vv` (`snapshots/normalize.json`): the gas of the 
 | `_dnslink` | 1,862 | |
 | `💩` | 4,084 | |
 | `🚴‍♂️` | 7,731 | |
-| `1️⃣` | 5,544 | data0 |
+| `1️⃣` | 5,544 | |
 | `abc💩def` | 10,474 | |
 | `café` | 6,058 | |
 | `café123` | 9,349 | |
