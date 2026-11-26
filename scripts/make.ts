@@ -43,6 +43,11 @@ const BUCKET_SIZE = 1 << BUCKET_BITS;
 const SUB_SIZE = 32; // cps per sub-index entry: a word of starts
 const SUB_COUNT = BUCKET_SIZE / SUB_SIZE;
 const DIRECT_LIMIT = 0x100; // cps below this are looked up directly
+const BUCKET_RUNS = 0;
+const BUCKET_PALETTE = 1;
+const BUCKET_TINY = 2;
+const TINY_RUNS = 3;
+const PALETTE_SLACK = 128; // a palette bucket can be this many bytes bigger than its runs
 const MAX_CONTRACT = 24576 - 1; // EIP-170, minus the leading STOP
 
 // class record bits
@@ -366,8 +371,11 @@ const mapOf = new Map<number, number>(); // cp => offset
 
 // ************************************************************
 // runs: per bucket of 256 cps, sorted (start, value) runs; identical buckets are shared
-// bucket: [n - 1][sub: 8][values: 2n][starts - 1: n - 1]
-// sub[k] = the run that contains cp 32k of the bucket, and the first start (0) isn't stored
+// a bucket is one of:
+//   tiny:    [2][value]([start - 1][value]) x 2    up to 3 runs (eg. Han, Hangul), unused starts are 0xff
+//   palette: [1][index: 256][values]   values[index[lo]]: when that's not much bigger than runs (dense scripts)
+//   runs:    [0][n - 1][sub: 8][values: 2n][starts - 1: n - 1]
+//            sub[k] = the run that contains cp 32k of the bucket, and the first start (0) isn't stored
 
 // a confused cp's class is also keyed by its whole, and those classes are numbered last:
 // CONF[class id - CONF_CLASS] is its (union, extent)
@@ -416,7 +424,7 @@ const hot = new Bytes();
 const buckets: {key: string; bytes: Uint8Array; score: number}[] = [];
 let hotBuckets = ''; // for the log: the best buckets (and how many share it), ! = didn't fit
 let runCount = 0;
-let maxRuns = 0;
+let maxBucket = 0;
 const direct = new Bytes();
 for (let cp = 0; cp < DIRECT_LIMIT; cp++) direct.u16(runValue(cp));
 for (let b = DIRECT_LIMIT >> BUCKET_BITS; b < LIMIT >> BUCKET_BITS; b++) {
@@ -433,12 +441,27 @@ for (let b = DIRECT_LIMIT >> BUCKET_BITS; b < LIMIT >> BUCKET_BITS; b++) {
 		if ((maskAll.get(cp) ?? 0n) & unrestricted) score++;
 		if (emojiRoot.has(cp)) score += HOT_EMOJI_WEIGHT;
 	}
-	const bytes = new Bytes().u8(starts.length - 1);
-	for (let k = 0; k < BUCKET_SIZE; k += SUB_SIZE) bytes.u8(starts.findLastIndex((x) => x <= k));
-	for (const x of values) bytes.u16(x);
-	for (const x of starts.slice(1)) bytes.u8(x - 1);
+	const bytes = new Bytes();
+	const palette = [...new Set(values)];
+	const paletteSize = 1 + BUCKET_SIZE + 2 * palette.length;
+	const runsSize = 1 + SUB_COUNT + 3 * starts.length;
+	if (starts.length <= TINY_RUNS) {
+		bytes.u8(BUCKET_TINY).u16(values[0]!);
+		for (let i = 1; i < TINY_RUNS; i++) bytes.u8(i < starts.length ? starts[i]! - 1 : 0xff).u16(values[i] ?? 0);
+	} else if (paletteSize <= runsSize + PALETTE_SLACK) {
+		bytes.u8(BUCKET_PALETTE);
+		starts.forEach((x, i) => {
+			for (const end = starts[i + 1] ?? BUCKET_SIZE; x < end; x++) bytes.u8(palette.indexOf(values[i]!));
+		});
+		for (const x of palette) bytes.u16(x);
+	} else {
+		bytes.u8(BUCKET_RUNS).u8(starts.length - 1);
+		for (let k = 0; k < BUCKET_SIZE; k += SUB_SIZE) bytes.u8(starts.findLastIndex((x) => x <= k));
+		for (const x of values) bytes.u16(x);
+		for (const x of starts.slice(1)) bytes.u8(x - 1);
+	}
 	buckets.push({key: `${starts}/${values}`, bytes: bytes.toBytes(), score});
-	maxRuns = Math.max(maxRuns, starts.length);
+	maxBucket = Math.max(maxBucket, bytes.length);
 }
 // the hot buckets are chosen after the other tables are built: see fillBuckets()
 function fillBuckets(budget: number) {
@@ -567,8 +590,15 @@ function lookupRun(cp: number): number {
 	let off = rd(view('INDEX'), (cp >> BUCKET_BITS) * 2, 2);
 	const r = view(off & INDEX_HOT ? 'HOT' : 'RUNS');
 	off &= ~INDEX_HOT;
-	const n = r[off]! + 1;
 	const lo = cp & (BUCKET_SIZE - 1);
+	const format = r[off++]!;
+	if (format === BUCKET_TINY) {
+		let v = rd(r, off, 2);
+		for (let i = 1; i < TINY_RUNS; i++) if (lo > r[off + 3 * i - 1]!) v = rd(r, off + 3 * i, 2);
+		return v;
+	}
+	if (format === BUCKET_PALETTE) return rd(r, off + BUCKET_SIZE + 2 * r[off + lo]!, 2);
+	const n = r[off]! + 1;
 	const values = off + 1 + SUB_COUNT;
 	const starts = values + 2 * n; // starts[i] is of run i + 1, minus 1
 	// the run that contains the sub-block, plus the next 32 starts that are <= lo
@@ -709,7 +739,7 @@ uint256 constant COMP_COUNT = ${comp.length / 9};
 /// @dev Class ids from CONF_CLASS are confused: CONF[id - CONF_CLASS].
 uint256 constant CONF_CLASS = ${CONF_CLASS};
 /// @dev The most bytes of a bucket in RUNS, and of a node in EMOJI.
-uint256 constant BUCKET_SIZE = ${SUB_COUNT + 3 * maxRuns};
+uint256 constant BUCKET_SIZE = ${maxBucket};
 uint256 constant EMOJI_NODE_SIZE = ${emojiNodeSize};
 /// @dev A bitmap in LISTS is its top bytes: shift right by this.
 uint256 constant LIST_BITMAP_SHIFT = ${256 - 8 * GROUP_BYTES};
@@ -766,4 +796,11 @@ for (const s of sections) {
 }
 console.log(`tables ${tables.length} bytes (in ENSNormalize)`);
 console.log(`hot buckets: ${hotBuckets}`);
+{
+	const fmt = (b: number) => 'RPT'[buckets[b - (DIRECT_LIMIT >> BUCKET_BITS)]!.bytes[0]!];
+	const unique = new Map(buckets.map((x) => [x.key, x.bytes[0]!]));
+	const count = (f: number) => [...unique.values()].filter((x) => x === f).length;
+	console.log(`buckets: ${count(BUCKET_TINY)} tiny, ${count(BUCKET_PALETTE)} palette, ${count(BUCKET_RUNS)} runs (max ${maxBucket} bytes)`);
+	console.log(`formats: ${[1, 2, 3, 4, 5, 6, 7, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0xf, 0x10, 0x1e, 0x1f, 0x20, 0x21, 0x30, 0x4e, 0xac, 0xff, 0x1f4].map((b) => `${b.toString(16)}:${fmt(b)}`).join(' ')}`);
+}
 console.log(`data ${codes.reduce((a, c) => a + c.length, 0)} bytes in ${codes.length} contracts: ${codes.map((c) => c.length).join(', ')}`);

@@ -95,11 +95,12 @@ contract ENSNormalize is IENSIP15 {
 
     // context
     uint256 private constant CTX_BUCKET_ID = 0x00; // the cached bucket + 1
-    uint256 private constant CTX_STARTS = 0x20; // pointer to its starts
-    uint256 private constant CTX_INDEX = 0x40; // its index entry + 1: buckets can share one
-    uint256 private constant CTX_MASK = 0x60; // 4 x [mask id + 1][mask]
-    uint256 private constant CTX_TABLES = 0x160; // offset of TABLES in this contract's code
-    uint256 private constant CTX_BUCKET = 0x180; // BUCKET_SIZE + 32, then EMOJI_NODE_SIZE + 32 of scratch
+    uint256 private constant CTX_INDEX = 0x20; // its index entry + 1: buckets can share one
+    uint256 private constant CTX_MODE = 0x40; // 0 = runs, 1 = palette, else the tiny bucket itself
+    uint256 private constant CTX_STARTS = 0x60; // runs: pointer to the starts
+    uint256 private constant CTX_MASK = 0x80; // 4 x [mask id + 1][mask]
+    uint256 private constant CTX_TABLES = 0x180; // offset of TABLES in this contract's code
+    uint256 private constant CTX_BUCKET = 0x1a0; // BUCKET_SIZE + 32, then EMOJI_NODE_SIZE + 32 of scratch
     uint256 private constant CTX_SCRATCH = CTX_BUCKET + BUCKET_SIZE + 32;
     uint256 private constant CTX_SIZE = CTX_SCRATCH + EMOJI_NODE_SIZE + 32;
 
@@ -302,8 +303,6 @@ contract ENSNormalize is IENSIP15 {
             e := add(i, utf8.length)
             // 4 bytes: likely an emoji, so don't look up here
             if gt(byte(0, calldataload(i)), 0xef) { state := S_TOKENIZE }
-            // 4 bytes: likely an emoji, so don't look up here
-            if gt(byte(0, calldataload(i)), 0xef) { state := S_TOKENIZE }
         }
         unchecked {
             while (i < e) {
@@ -311,41 +310,34 @@ contract ENSNormalize is IENSIP15 {
                 assembly ("memory-safe") {
                     let w := calldataload(i)
                     cp := byte(0, w)
-                    switch lt(cp, 0x80)
-                    case 1 { i := add(i, 1) }
-                    default {
-                        switch lt(cp, 0xe0)
-                        case 1 {
+                    i := add(i, 1)
+                    for {} gt(cp, 0x7f) {} {
+                        if lt(cp, 0xe0) {
                             // 110xxxxx 10xxxxxx
                             w := shr(240, w)
                             bad := or(bad, or(lt(cp, 0xc2), xor(and(w, 0xc0), 0x80)))
                             cp := or(shl(6, and(cp, 0x1f)), and(w, 0x3f))
+                            i := add(i, 1)
+                            break
+                        }
+                        if lt(cp, 0xf0) {
+                            // 1110xxxx 10xxxxxx 10xxxxxx
+                            w := shr(232, w)
+                            cp := or(shl(12, and(cp, 0x0f)), or(and(shr(2, w), 0xfc0), and(w, 0x3f)))
+                            bad := or(bad, or(xor(and(w, 0xc0c0), 0x8080), or(lt(cp, 0x800), eq(shr(11, cp), 0x1b))))
                             i := add(i, 2)
+                            break
                         }
-                        default {
-                            switch lt(cp, 0xf0)
-                            case 1 {
-                                // 1110xxxx 10xxxxxx 10xxxxxx
-                                w := shr(232, w)
-                                cp := or(shl(12, and(cp, 0x0f)), or(and(shr(2, w), 0xfc0), and(w, 0x3f)))
-                                bad := or(
-                                    bad,
-                                    or(xor(and(w, 0xc0c0), 0x8080), or(lt(cp, 0x800), eq(shr(11, cp), 0x1b)))
-                                )
-                                i := add(i, 3)
-                            }
-                            default {
-                                // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-                                w := shr(224, w)
-                                bad := or(bad, or(gt(cp, 0xf4), xor(and(w, 0xc0c0c0), 0x808080)))
-                                cp := or(
-                                    or(shl(18, and(cp, 0x07)), and(shr(4, w), 0x3f000)),
-                                    or(and(shr(2, w), 0xfc0), and(w, 0x3f))
-                                )
-                                bad := or(bad, or(lt(cp, 0x10000), gt(cp, 0x10ffff)))
-                                i := add(i, 4)
-                            }
-                        }
+                        // 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+                        w := shr(224, w)
+                        bad := or(bad, or(gt(cp, 0xf4), xor(and(w, 0xc0c0c0), 0x808080)))
+                        cp := or(
+                            or(shl(18, and(cp, 0x07)), and(shr(4, w), 0x3f000)),
+                            or(and(shr(2, w), 0xfc0), and(w, 0x3f))
+                        )
+                        bad := or(bad, or(lt(cp, 0x10000), gt(cp, 0x10ffff)))
+                        i := add(i, 3)
+                        break
                     }
                 }
                 if (state & S_TOKENIZE != 0) {
@@ -533,47 +525,67 @@ contract ENSNormalize is IENSIP15 {
         assembly ("memory-safe") {
             let tables := mload(add(ctx, CTX_TABLES))
             // the value of cp: a class id, or 0x8000 | offset in MAP
-            switch lt(cp, 0x100)
-            case 1 {
-                // ascii and Latin-1: direct
-                codecopy(0, add(add(tables, DIRECT_OFFSET), shl(1, cp)), 2)
-                v := shr(240, mload(0))
-            }
-            default {
-                switch lt(cp, LIMIT)
-                case 0 { v := mul(IGNORED_CLASS, and(gt(cp, sub(IGNORED_LO, 1)), lt(cp, add(IGNORED_HI, 1)))) }
-                default {
-                    // the bucket of cp >> 8, cached: [n - 1][sub: 8][values: 2n][starts - 1: n - 1]
-                    let b := add(shr(8, cp), 1)
-                    let p := add(ctx, CTX_BUCKET)
-                    if iszero(eq(mload(ctx), b)) {
-                        mstore(ctx, b)
-                        // index: offset in RUNS, or 0x8000 | offset in HOT
-                        codecopy(0, add(add(tables, sub(INDEX_OFFSET, 2)), shl(1, b)), 2)
-                        b := add(shr(240, mload(0)), 1)
-                        if iszero(eq(mload(add(ctx, CTX_INDEX)), b)) {
-                            mstore(add(ctx, CTX_INDEX), b)
-                            switch and(b, 0x8000)
-                            case 0 { extcodecopy(runs, p, add(sub(RUNS_OFFSET, 1), b), BUCKET_SIZE) }
-                            default { codecopy(p, add(add(tables, sub(HOT_OFFSET, 0x8001)), b), BUCKET_SIZE) }
-                            b := byte(0, mload(p)) // n - 1
-                            let s := add(add(p, 11), shl(1, b)) // starts
+            for {} 1 {} {
+                if lt(cp, 0x100) {
+                    // ascii and Latin-1: direct
+                    codecopy(0, add(add(tables, DIRECT_OFFSET), shl(1, cp)), 2)
+                    v := shr(240, mload(0))
+                    break
+                }
+                if iszero(lt(cp, LIMIT)) {
+                    v := mul(IGNORED_CLASS, and(gt(cp, sub(IGNORED_LO, 1)), lt(cp, add(IGNORED_HI, 1))))
+                    break
+                }
+                // the bucket of cp >> 8, cached
+                let b := add(shr(8, cp), 1)
+                let p := add(ctx, CTX_BUCKET)
+                if iszero(eq(mload(ctx), b)) {
+                    mstore(ctx, b)
+                    // index: offset in RUNS, or 0x8000 | offset in HOT
+                    codecopy(0, add(add(tables, sub(INDEX_OFFSET, 2)), shl(1, b)), 2)
+                    b := add(shr(240, mload(0)), 1)
+                    if iszero(eq(mload(add(ctx, CTX_INDEX)), b)) {
+                        mstore(add(ctx, CTX_INDEX), b)
+                        switch and(b, 0x8000)
+                        case 0 { extcodecopy(runs, p, add(sub(RUNS_OFFSET, 1), b), BUCKET_SIZE) }
+                        default { codecopy(p, add(add(tables, sub(HOT_OFFSET, 0x8001)), b), BUCKET_SIZE) }
+                        b := mload(p)
+                        switch byte(0, b)
+                        case 0 {
+                            // runs: [0][n - 1][sub: 8][values: 2n][starts - 1: n - 1]
+                            b := byte(1, b)
+                            let s := add(add(p, 12), shl(1, b))
                             mstore(add(s, b), not(0)) // pad with 0xff: never < lo
                             mstore(add(ctx, CTX_STARTS), s)
+                            b := 0
                         }
+                        case 1 { b := 1 }
+                        mstore(add(ctx, CTX_MODE), b)
                     }
-                    // sub[lo >> 5] is the run that contains the sub-block: add the next 32 starts that are <= lo
-                    // in 16-bit lanes, (0xff + lo - (start - 1)) has bit 8 set if start <= lo
-                    let lo := and(cp, 0xff)
-                    let l := byte(shr(5, lo), mload(add(p, 1)))
-                    let w := mload(add(mload(add(ctx, CTX_STARTS)), l))
-                    lo := mul(add(0xff, lo), LANES)
-                    w := add(
-                        and(shr(8, sub(lo, and(w, BYTES))), LANES),
-                        and(shr(8, sub(lo, and(shr(8, w), BYTES))), LANES)
-                    )
-                    v := shr(240, mload(add(add(p, 9), shl(1, add(l, shr(240, mul(w, LANES))))))) // values[l + sum]
                 }
+                let lo := and(cp, 0xff)
+                b := mload(add(ctx, CTX_MODE))
+                if eq(b, 1) {
+                    // palette: [1][index: 256][values]
+                    v := shr(240, mload(add(add(p, 257), shl(1, byte(0, mload(add(add(p, 1), lo)))))))
+                    break
+                }
+                if b {
+                    // tiny: [2][value]([start - 1][value]) x 2
+                    v := shr(232, b)
+                    if gt(lo, byte(3, b)) { v := shr(208, b) }
+                    if gt(lo, byte(6, b)) { v := shr(184, b) }
+                    v := and(v, 0xffff)
+                    break
+                }
+                // runs: sub[lo >> 5] is the run that contains the sub-block, plus the next 32 starts <= lo
+                // in 16-bit lanes, (0xff + lo - (start - 1)) has bit 8 set if start <= lo
+                b := byte(shr(5, lo), mload(add(p, 2)))
+                let w := mload(add(mload(add(ctx, CTX_STARTS)), b))
+                lo := mul(add(0xff, lo), LANES)
+                w := add(and(shr(8, sub(lo, and(w, BYTES))), LANES), and(shr(8, sub(lo, and(shr(8, w), BYTES))), LANES))
+                v := shr(240, mload(add(add(p, 10), shl(1, add(b, shr(240, mul(w, LANES)))))))
+                break
             }
             switch and(v, 0x8000)
             case 0 {
