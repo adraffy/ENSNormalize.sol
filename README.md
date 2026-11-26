@@ -98,20 +98,20 @@ Steps 2-6 don't allocate: the context (caches), the codepoints, and the output e
 `scripts/make.ts` derives the tables, replays every lookup through the encoded bytes, and writes `src/generated/ENSNormalizeData.sol`: the constants, `TABLES`, and the data contracts (each starts with STOP).
 Every table is random access, since the contract can't decode a compressed stream on every call.
 
-`TABLES` (16,958 bytes) is a literal in `ENSNormalize`, returned by `tables()`. It's the only data in the contract's code, so solc puts it right before the metadata, and the contract reads it with `CODECOPY` at `codesize() - metadata - TABLES_SIZE`. Reading its own code has no account access cost (a data contract is 2600 for the first read, then 100).
+`TABLES` (16,997 bytes) is a literal in `ENSNormalize`, returned by `tables()`. It's the only data in the contract's code, so solc puts it right before the metadata, and the contract reads it with `CODECOPY` at `codesize() - metadata - TABLES_SIZE`. Reading its own code has no account access cost (a data contract is 2600 for the first read, then 100).
 That placement isn't guaranteed by the compiler: `test_tables` checks it, and it doesn't hold with via-IR.
 
 | section | in | bytes | what |
 |---|---|--:|---|
 | DIRECT | tables | 512 | the value of each codepoint below 0x100 (ascii and Latin-1) |
 | INDEX | tables | 2,042 | `cp >> 8` => offset of its bucket in RUNS, or `0x8000` + its offset in HOT (codepoints from `LIMIT` = 0x3FD00 up are disallowed, except the ignored E0100-E01EF) |
-| HOT | tables | 1,868 | buckets, like RUNS: the most valid codepoints (of unrestricted groups) and emoji starts per byte, in what the other tables leave of `TABLES_BUDGET` |
-| CLASSES | tables | 5,048 | 1,262 class records (u32): mask id, combining class rank, NFC_QC, CM, NSM, confused, unique, has decomposition, emoji node, valid, ignored, fenced, underscore |
+| HOT | tables | 1,877 | buckets, like RUNS: the most valid codepoints (of unrestricted groups) and emoji starts per byte, in what the other tables leave of `TABLES_BUDGET` |
+| CLASSES | tables | 5,068 | 1,267 class records (u32): mask id, combining class rank, NFC_QC, CM, NSM, confused, unique, has decomposition, emoji node, valid, ignored, fenced, underscore |
 | EMOJI | tables | 4,997 | emoji DAWG (227 nodes): `[terminal << 7 \| n][(cp: u24, node: u8) x n]` |
-| MASKS | tables | 816 | mask id => (all groups, primary groups) |
-| LISTS | tables | 1,675 | a group mask: a list of bit indices, or a bitmap when that's smaller |
-| RUNS | data0 | 16,259 | buckets of 256 codepoints, identical ones are shared |
-| CONF | data0 | 2,832 | for each confused class: its whole's groups and its extent's groups |
+| MASKS | tables | 820 | mask id => (all groups, primary groups) |
+| LISTS | tables | 1,681 | a group mask: a list of bit indices, or a bitmap when that's smaller |
+| RUNS | data0 | 16,313 | buckets of 256 codepoints, identical ones are shared |
+| CONF | data0 | 2,848 | for each confused class: its whole's groups and its extent's groups |
 | DECOMP | data0 | 1,827 | canonical decompositions reachable from valid codepoints |
 | COMP | data0 | 3,267 | compositions that can occur |
 | MAP | data1 | 11,040 | mappings: linear (`cp + delta`), or a table of n codepoints of 2 or 3 bytes |
