@@ -126,16 +126,3 @@ A value is a class id, or `0x8000` + an offset in MAP. A bucket gives the value 
 
 The last bucket is cached in memory for the call (by its index entry, so buckets that share one aren't copied again), and 4 group masks.
 A confused codepoint's class is also keyed by its whole, and those class ids are last, so CONF is indexed by `class id - CONF_CLASS`.
-
-## Layout
-
-| path | what |
-|---|---|
-| `src/ENSNormalize.sol` | the contract |
-| `src/IENSIP15.sol` | interface, from contracts-v2 |
-| `src/generated/ENSNormalizeData.sol` | **generated:** constants, `TABLES`, data contracts, `ENSNormalizeDataDeployer` |
-| `scripts/make.ts` | spec => tables (`scripts/nf.ts`: NFC/NFD) |
-| `scripts/download.ts` | fetches the spec and tests |
-| `test/ENSNormalize.t.sol` | tests.json, examples |
-| `test/Lookup.t.sol` | every codepoint's lookup |
-| `test/Gas.t.sol` | gas report (`snapshots/`) |
