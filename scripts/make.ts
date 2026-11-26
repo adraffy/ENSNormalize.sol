@@ -563,6 +563,9 @@ library ENSNormalizeSpec {
     // unicode ${spec.unicode}
     // cldr ${spec.cldr}
 
+    /// @dev sha256(spec.json)
+    bytes32 internal constant SPEC_HASH = 0x${new Bun.CryptoHasher('sha256').update(specBytes).digest('hex')};
+
     uint256 internal constant DATA_COUNT = ${codes.length};
 
     /// @dev The codehash of each data contract.

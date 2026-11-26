@@ -3,16 +3,20 @@
 [ENSIP-15](https://docs.ens.domains/ensip/15) label normalization in Solidity.
 It implements `IENSIP15` (from [ensdomains/contracts-v2](https://github.com/ensdomains/contracts-v2)): `normalize(label)` returns the normalized label, or reverts `CannotNormalize(label)`.
 
-It's a port of the label validation in [adraffy/ens-normalize.ts](https://github.com/adraffy/ens-normalize.ts).
-The tables are derived from the spec files of [adraffy/ens-normalize-derive](https://github.com/adraffy/ens-normalize-derive) (`spec.json`, `nf.json`), and the tests are its `tests.json`.
+The algorithm follows the reference implementation in [adraffy/ens-normalize-derive](https://github.com/adraffy/ens-normalize-derive) (`src/ensip15.ts`). The tables are derived from its spec files (`spec.json`, `nf.json`), and the tests are its `tests.json`.
 
-- **Per label:** ENSIP-15 validates each label on its own, so there's no name splitting. `.` is a disallowed character, and `""` reverts (empty label).
+- **Per label:** ENSIP-15 validates each label on its own, so there's no name splitting. `.` is a disallowed character, and `normalize("")` reverts: an empty label is invalid (only an empty *name* normalizes to `""`).
 - **Only `normalize`:** no beautify, fragments, or tokenize. Error messages aren't reproduced: every failure is `CannotNormalize`.
 - **Invalid UTF-8** (overlong, surrogates, truncated, > U+10FFFF) reverts.
-- **Immutable and ownerless:** the tables are deployed as code in data contracts (read with `EXTCODECOPY`). `ENSNormalize` checks each one's codehash in its constructor. A new spec is a new deployment.
+- **Ownerless and immutable:** a new spec is a new deployment. The tables are deployed as code in data contracts (read with `EXTCODECOPY`), and `ENSNormalize` checks each one's codehash in its constructor.
+- **`specHash()`** returns the sha256 of the `spec.json` it was built from (`spec_hash` in ens-normalize-derive's `tests.json`).
 
 ```solidity
-IENSIP15 ens = IENSIP15(ENSNORMALIZE);
+import {IENSIP15} from "ENSNormalize.sol/src/IENSIP15.sol";
+import {ENSNormalize} from "ENSNormalize.sol/src/ENSNormalize.sol";
+import {ENSNormalizeDataDeployer} from "ENSNormalize.sol/src/generated/ENSNormalizeData.sol";
+
+IENSIP15 ens = new ENSNormalize(ENSNormalizeDataDeployer.deploy());
 ens.normalize("RaFFY"); // "raffy"
 ens.normalize(unicode"🚴‍♂️"); // "🚴‍♂"
 ens.normalize("a_b"); // reverts CannotNormalize("a_b")
@@ -28,7 +32,6 @@ bun run download   # data/spec.json, nf.json, tests.json from ens-normalize-deri
 bun run make       # data/*.json => src/generated/ENSNormalizeData.sol
 forge test         # includes every test in data/tests.json
 forge test --mc GasTest -vv   # gas report
-forge script script/Deploy.s.sol --rpc-url $RPC_URL --broadcast
 ```
 
 `data/` is downloaded and gitignored. `src/generated/` is committed. CI regenerates it and fails if it changes.
@@ -67,18 +70,18 @@ There's no length limit, but memory grows with the label (about 6 words per code
 | `a` x 1,024 | 1,024 | 182,511 |
 | `é` x 1,024 | 2,048 | 2,894,601 |
 
-Deploying is about 13M gas: 51 KB of tables in 3 data contracts (11.2M) and `ENSNormalize` (8 KB, 1.8M). Each is its own transaction, under the EIP-7825 cap of 16.7M.
+Deploying is about 13M gas: 51 KB of tables in 3 data contracts (11.2M) and `ENSNormalize` (8 KB, 1.8M). Deploy `ENSNormalizeData0`, `1`, `2`, then `ENSNormalize` with their addresses, each in its own transaction (under the EIP-7825 cap of 16.7M); `ENSNormalizeDataDeployer.deploy()` does this from a forge script.
 
 ## How it works
 
 `normalize(label)`:
 
-1. **ascii fast path:** if every byte is valid ascii (`a-z0-9-_$`) or `A-Z`, lowercase it and check the underscore and label extension (`??--`) rules. No table reads.
-2. **decode** UTF-8 into codepoints.
-3. **tokenize:** at each codepoint, take the longest emoji (FE0F is optional where it appears in the fully-qualified form, and dropped from the output). Otherwise a codepoint is valid, mapped, ignored, or disallowed (revert).
-4. **NFC** each text run. A quick check (NFC_QC and canonical order) skips it for text that's already NFC. Otherwise: decompose, reorder, compose.
-5. **validate:** underscore only at the start; ascii labels can't have `--` at 3-4; a text run can't start with a combining mark; fenced characters can't be leading, trailing, or adjacent; the label's group is the highest priority group that contains every text codepoint; for groups without a CM whitelist, a CM's base must be primary in the group, and the NFD can't have duplicate or more than 4 consecutive non-spacing marks; whole-script confusables.
-6. **encode** UTF-8.
+1. **ASCII Fast Path:** if every byte is valid ascii (`a-z0-9-_$`) or `A-Z`, lowercase it and check the underscore and label extension (`??--`) rules. No table reads.
+2. **Decode:** UTF-8 into codepoints.
+3. **Tokenize:** at each codepoint, take the longest emoji (FE0F is optional where it appears in the fully-qualified form, and dropped from the output). Otherwise a codepoint is valid, mapped, ignored, or disallowed (revert).
+4. **NFC:** each text run. A quick check (NFC_QC and canonical order) skips it for text that's already NFC. Otherwise: decompose, reorder, compose.
+5. **Validate:** underscore only at the start; ascii labels can't have `--` at 3-4; a text run can't start with a combining mark; fenced characters can't be leading, trailing, or adjacent; the label's group is the highest priority group that contains every text codepoint; for groups without a CM whitelist, a CM's base must be primary in the group, and the NFD can't have duplicate or more than 4 consecutive non-spacing marks; whole-script confusables.
+6. **Encode:** UTF-8.
 
 Groups are bits of a `uint256` (171 groups), so group selection is an AND of each codepoint's mask, and the whole-script confusable check is a few ANDs:
 the label is confusable if no codepoint is unique to one group, it has a confused codepoint, and some group is in every confused codepoint's complement (the groups of its whole outside its extent) and contains every other codepoint.
@@ -116,4 +119,3 @@ The current bucket, bucket 0 (ascii), class records, and the last group mask are
 | `test/ENSNormalize.t.sol` | tests.json, examples |
 | `test/Gas.t.sol` | gas report |
 | `test/Long.t.sol` | long labels |
-| `script/Deploy.s.sol` | deployment |

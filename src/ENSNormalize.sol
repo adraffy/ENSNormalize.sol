@@ -6,9 +6,9 @@ import {ENSNormalizeSpec as Spec} from "./generated/ENSNormalizeData.sol";
 
 /// @title ENSNormalize
 /// @notice ENSIP-15 label normalization.
-/// @dev A port of the label validation in adraffy/ens-normalize.ts, using tables derived from
-///      adraffy/ens-normalize-derive (scripts/make.ts). The tables live in immutable data contracts
-///      (code read with EXTCODECOPY). There is no owner: a new spec is a new deployment.
+/// @dev Follows the reference implementation in adraffy/ens-normalize-derive (src/ensip15.ts), using tables
+///      derived from its spec files (scripts/make.ts). The tables live in data contracts (code read with EXTCODECOPY).
+///      Contract is ownerless and immutable: a new spec is a new deployment.
 ///
 ///      normalize(label):
 ///      1. decode UTF-8
@@ -102,6 +102,11 @@ contract ENSNormalize is IENSIP15 {
     /// @notice ERC-165
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
         return interfaceId == type(IENSIP15).interfaceId || interfaceId == 0x01ffc9a7;
+    }
+
+    /// @notice The sha256 of the spec.json this was built from (spec_hash in ens-normalize-derive's tests.json).
+    function specHash() external pure returns (bytes32) {
+        return Spec.SPEC_HASH;
     }
 
     /// @inheritdoc IENSIP15

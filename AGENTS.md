@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repo. See README.md for the design
 
 ## What this is
 
-ENSIP-15 label normalization in Solidity: `ENSNormalize` implements `IENSIP15` (`normalize(label)` returns the normalized label or reverts `CannotNormalize`). It ports the label validation of [ens-normalize.ts](https://github.com/adraffy/ens-normalize.ts), with tables derived from [ens-normalize-derive](https://github.com/adraffy/ens-normalize-derive) (`spec.json`, `nf.json`). The priorities are:
+ENSIP-15 label normalization in Solidity: `ENSNormalize` implements `IENSIP15` (`normalize(label)` returns the normalized label or reverts `CannotNormalize`). The algorithm follows the reference implementation in [ens-normalize-derive](https://github.com/adraffy/ens-normalize-derive) (`src/ensip15.ts`), and the tables are derived from its spec files (`spec.json`, `nf.json`). The priorities are:
 
 1. **Correctness:** every entry of ens-normalize-derive's `tests.json` must pass (output, or revert when `error` is set).
 2. **Gas:** `normalize()` should stay cheap. Check the gas report for every change to the contract.
@@ -43,7 +43,6 @@ Run `bun run make`, `forge fmt --check`, and `forge test` before considering a c
 | `test/ENSNormalize.t.sol` | tests.json (sharded), examples, invalid UTF-8, constructor checks |
 | `test/TestsJSON.sol` | minimal JSON parser for tests.json (forge's cheatcodes coerce strings and reject lone surrogates) |
 | `test/Gas.t.sol`, `test/Long.t.sol` | gas reports |
-| `script/Deploy.s.sol` | deploys the data contracts, then ENSNormalize |
 
 `data/` is downloaded and gitignored. `src/generated/` is committed; CI regenerates it and fails if it changes.
 

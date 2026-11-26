@@ -8,6 +8,9 @@ library ENSNormalizeSpec {
     // unicode 18.0.0 (2026-11-25T20:48:52.431Z)
     // cldr 48.2 (2026-03-28T19:59:34.849Z)
 
+    /// @dev sha256(spec.json)
+    bytes32 internal constant SPEC_HASH = 0x925a274af874e5d513fe56e752c13e44fb55e9e9debb55e79bf0a2a7eb4e6f6e;
+
     uint256 internal constant DATA_COUNT = 3;
 
     /// @dev The codehash of each data contract.

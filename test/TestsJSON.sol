@@ -10,6 +10,7 @@ library TestsJSON {
         string name;
         string norm; // == name if the test has no norm
         bool fails;
+        string specHash; // only the version entry
     }
 
     error ParseError(uint256 pos);
@@ -42,6 +43,8 @@ library TestsJSON {
                     bytes32 k = keccak256(key);
                     if (k == keccak256("name")) {
                         t.name = string(value);
+                    } else if (k == keccak256("spec_hash")) {
+                        t.specHash = string(value);
                     } else if (k == keccak256("norm")) {
                         t.norm = string(value);
                         hasNorm = true;
