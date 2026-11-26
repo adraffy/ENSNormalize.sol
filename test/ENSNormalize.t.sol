@@ -55,6 +55,7 @@ contract ENSNormalizeTest is Test {
     function _run(uint256 shard) internal {
         vm.pauseGasMetering();
         TestsJSON.Test[] memory tests = TestsJSON.parse(bytes(vm.readFile("data/tests.json")));
+        assertEq(ens.specHash(), vm.parseBytes32(string.concat("0x", tests[0].specHash)), "tests are for this spec");
         uint256 fails;
         uint256 count;
         for (uint256 i = 1 + shard; i < tests.length; i += SHARDS) {
