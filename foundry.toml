@@ -1,0 +1,11 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 10000
+# tests.json is read and parsed by the tests
+fs_permissions = [{ access = "read", path = "./data" }]
+gas_limit = "18446744073709551615"
+memory_limit = 1073741824
