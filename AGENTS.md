@@ -14,7 +14,7 @@ The deployment is immutable and ownerless: no admin, no upgrades. A new spec is 
 
 ## Commands
 
-Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh). The compiler is [Solar](https://github.com/paradigmxyz/solar), pinned in `foundry.toml` (`solc = "solar:0.3.0"`); forge installs it. The code must also compile and pass with solc: `forge test --use 0.8.38`.
+Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh). The compiler is [Solar](https://github.com/paradigmxyz/solar), pinned in `foundry.toml` (`solc = "solar:0.3.1"`); forge installs it. The code must also compile and pass with solc: `forge test --use 0.8.38`.
 
 ```sh
 bun install
