@@ -24,7 +24,7 @@ ens.normalize("a_b"); // reverts CannotNormalize("a_b")
 
 ## Commands
 
-Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh). It compiles with [Solar](https://github.com/paradigmxyz/solar) (`solc = "solar:0.3.0"` in `foundry.toml`, which forge installs). It also compiles with solc (`forge build --use 0.8.38`), at about 15% more gas.
+Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh). It compiles with [Solar](https://github.com/paradigmxyz/solar) (`solc = "solar:0.3.1"` in `foundry.toml`, which forge installs). It also compiles with solc (`forge build --use 0.8.38`), at about 15% more gas.
 
 ```sh
 bun install
@@ -55,27 +55,27 @@ From `forge test --mc GasTest -vv` (`snapshots/normalize.json`): the gas of the 
 | `a` x 255 | 2,244 | |
 | `RaFFY` | 1,526 | |
 | `_dnslink` | 1,765 | |
-| `💩` | 3,375 | |
-| `🚴‍♂️` | 6,517 | |
-| `1️⃣` | 4,645 | |
-| `abc💩def` | 8,870 | |
-| `café` | 5,020 | |
-| `café123` | 7,779 | |
-| `cafe` + U+0301 (NFC) | 13,365 | data0 |
-| `日本語` | 5,475 | |
-| `한국어` | 5,342 | |
-| `привет` | 9,870 | data0 |
-| `ελληνικά` | 11,540 | data0 |
-| `عربي` | 8,250 | data0 |
-| `नमस्ते` | 13,830 | data0 |
-| `ＢＩＴＣＯＩＮ` | 21,554 | data0, data1 |
+| `💩` | 3,369 | |
+| `🚴‍♂️` | 6,502 | |
+| `1️⃣` | 4,636 | |
+| `abc💩def` | 8,835 | |
+| `café` | 4,965 | |
+| `café123` | 7,695 | |
+| `cafe` + U+0301 (NFC) | 13,338 | data0 |
+| `日本語` | 5,449 | |
+| `한국어` | 5,316 | |
+| `привет` | 9,844 | data0 |
+| `ελληνικά` | 11,514 | data0 |
+| `عربي` | 8,224 | data0 |
+| `नमस्ते` | 13,804 | data0 |
+| `ＢＩＴＣＯＩＮ` | 21,522 | data0, data1 |
 
 - **ASCII:** a label of only `a-z0-9-` is checked 32 bytes at a time and returned as-is. Other valid ascii and `A-Z` is one loop. Neither reads a table.
 - **No data contract:** ascii and Latin-1, the buckets where most emoji start, Han, and Hangul are in `ENSNormalize`'s own code, with the class records, emoji, and group masks. A label of only those reads no other contract.
 - **data0** has the other buckets, whole-script confusables, and NFC. **data1** has the mappings (only mapped characters read it).
-- There's no length limit. Text costs about 710 per codepoint (`é` x 100 is 71,145), emoji about 1,800 (`💩` x 100 is 181,247), and text that isn't NFC about 4,300 per composition (`e` + U+0301 x 100 is 427,555).
+- There's no length limit. Text costs about 710 per codepoint (`é` x 100 is 71,119), emoji about 1,800 (`💩` x 100 is 180,944), and text that isn't NFC about 4,300 per composition (`e` + U+0301 x 100 is 428,229).
 
-Deploying is about 12.3M gas (`snapshots/deploy.json`): `ENSNormalizeData0` (4.9M), `ENSNormalizeData1` (2.2M), then `ENSNormalize` with their addresses (5.1M), each in its own transaction (under the EIP-7825 cap of 16.7M). `ENSNormalizeDataDeployer.deploy()` deploys the data contracts from a forge script.
+Deploying is about 12.2M gas (`snapshots/deploy.json`): `ENSNormalizeData0` (4.9M), `ENSNormalizeData1` (2.2M), then `ENSNormalize` with their addresses (5.1M), each in its own transaction (under the EIP-7825 cap of 16.7M). `ENSNormalizeDataDeployer.deploy()` deploys the data contracts from a forge script.
 
 ## How it works
 
