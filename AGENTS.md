@@ -25,10 +25,11 @@ forge test --nmt test_tests          # quick: skip tests.json
 forge test --mc GasTest -vv          # gas report (normalize + deploy), writes snapshots/
 forge test --mc ProbeTest --flamegraph   # where the gas goes, per internal function (write a throwaway test)
 forge build --sizes       # ENSNormalize must stay under 24,576 bytes
+bun run labels            # every known ENS label vs the reference implementation (about 30s, not in CI)
 forge fmt
 ```
 
-Run `bun run make`, `forge fmt --check`, and `forge test` before considering a change done. Commit `snapshots/` and report the gas change (`git diff snapshots/`) and, for encoding changes, the size change.
+Run `bun run make`, `forge fmt --check`, and `forge test` before considering a change done. Commit `snapshots/` and report the gas change (`git diff snapshots/`) and, for encoding changes, the size change. For changes to the contract, the encoding, or the spec, also run `bun run labels`.
 
 GasTest measures the call itself (not the test's overhead), and forge treats every account as cold on each call: the numbers include 2600 for each data contract a label reads.
 
@@ -47,6 +48,7 @@ GasTest measures the call itself (not the test's overhead), and forge treats eve
 | `test/Lookup.t.sol` | the contract's `_lookup()` of every codepoint vs `LOOKUP_HASH` from make.ts, and where it reads `TABLES` |
 | `test/TestsJSON.sol` | minimal JSON parser for tests.json (forge's cheatcodes coerce strings and reject lone surrogates) |
 | `test/Gas.t.sol` | gas report |
+| `scripts/labels.ts`, `labels/Labels.t.sol` | every label of adraffy/ens-labels vs ens-normalize-derive's `src/ensip15.ts` (`exhaustive` profile: `labels/` isn't compiled by default) |
 | `snapshots/` | the gas report's output: `normalize.json`, `deploy.json` |
 
 `data/` is downloaded and gitignored. `src/generated/` and `snapshots/` are committed; CI regenerates the data and fails if it changes.
