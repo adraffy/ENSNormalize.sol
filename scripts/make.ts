@@ -759,6 +759,8 @@ bytes32 constant LOOKUP_HASH = ${lookupHash};
 
 uint256 constant TABLES_SIZE = ${tables.length};
 bytes32 constant TABLES_HASH = ${keccak256(tables)};
+/// @dev The last 32 bytes of TABLES: the constructor looks for it to find TABLES in the code.
+bytes32 constant TABLES_TAIL = 0x${Buffer.from(tables.slice(-32)).toString('hex')};
 bytes constant TABLES =
     hex"${Buffer.from(tables).toString('hex')}";
 ${codes

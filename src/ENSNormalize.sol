@@ -36,6 +36,8 @@ import {
     DATA_COUNT,
     dataHash,
     TABLES_SIZE,
+    TABLES_HASH,
+    TABLES_TAIL,
     TABLES
 } from "./generated/ENSNormalizeData.sol";
 
@@ -59,6 +61,12 @@ import {
 contract ENSNormalize is IENSIP15 {
     /// @dev A data contract doesn't match the spec.
     error InvalidData(uint256 index);
+
+    /// @dev TABLES wasn't found in the code.
+    error InvalidTables();
+
+    /// @dev How far TABLES starts from the end of the code (found by the constructor).
+    uint256 private immutable _tablesFromEnd;
 
     // class record (scripts/make.ts)
     uint256 private constant C_MASK = 0xff; // index into MASKS
@@ -140,8 +148,10 @@ contract ENSNormalize is IENSIP15 {
     address private immutable _map;
 
     /// @param data The data contracts: ENSNormalizeData0, ENSNormalizeData1, ...
+    ///        ABI-encoded as usual (`new ENSNormalize(data)`): the constructor finds the end of the runtime code from it.
     constructor(address[] memory data) {
         if (data.length != DATA_COUNT) revert InvalidData(data.length);
+        _tablesFromEnd = _findTables(64 + (data.length << 5));
         for (uint256 i; i < data.length; ++i) {
             if (data[i].codehash != dataHash(i)) revert InvalidData(i);
         }
@@ -150,6 +160,30 @@ contract ENSNormalize is IENSIP15 {
         _decomp = data[DECOMP_DATA];
         _comp = data[COMP_DATA];
         _map = data[MAP_DATA];
+    }
+
+    /// @dev Finds TABLES in the runtime code, which is at the end of the initcode, before the arguments.
+    ///      Where the compiler puts the literal isn't specified (solc puts it before the metadata, Solar adds
+    ///      padding), so look for its last 32 bytes near the end and check its hash.
+    ///      Returns how far it starts from the end of the runtime code.
+    function _findTables(uint256 argsSize) private pure returns (uint256 fromEnd) {
+        bool found;
+        assembly ("memory-safe") {
+            let end := sub(codesize(), argsSize) // the end of the runtime code
+            let p := sub(end, 32)
+            for { let lo := sub(end, 2048) } gt(p, lo) { p := sub(p, 1) } {
+                codecopy(0, p, 32)
+                if eq(mload(0), TABLES_TAIL) {
+                    let start := sub(add(p, 32), TABLES_SIZE)
+                    let m := mload(0x40)
+                    codecopy(m, start, TABLES_SIZE)
+                    found := eq(keccak256(m, TABLES_SIZE), TABLES_HASH)
+                    fromEnd := sub(end, start)
+                    break
+                }
+            }
+        }
+        if (!found) revert InvalidTables();
     }
 
     /// @notice ERC-165
@@ -163,7 +197,7 @@ contract ENSNormalize is IENSIP15 {
     }
 
     /// @notice The tables in this contract's code.
-    /// @dev This is the only data in the code, so it's right before the metadata: see _context().
+    /// @dev Referencing the literal puts it in the runtime code, where _context() reads it.
     function tables() external pure returns (bytes memory) {
         return TABLES;
     }
@@ -274,13 +308,12 @@ contract ENSNormalize is IENSIP15 {
     // ************************************************************
     // general
 
-    function _context() internal pure returns (uint256 ctx) {
+    function _context() internal view returns (uint256 ctx) {
+        uint256 fromEnd = _tablesFromEnd;
         assembly ("memory-safe") {
             ctx := mload(0x40)
             calldatacopy(ctx, calldatasize(), CTX_TABLES) // zero the tags
-            // the code ends with [TABLES][metadata][metadata length: 2]
-            codecopy(0, sub(codesize(), 2), 2)
-            mstore(add(ctx, CTX_TABLES), sub(sub(codesize(), add(shr(240, mload(0)), 2)), TABLES_SIZE))
+            mstore(add(ctx, CTX_TABLES), sub(codesize(), fromEnd))
         }
     }
 

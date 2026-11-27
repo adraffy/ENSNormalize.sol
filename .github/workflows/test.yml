@@ -42,3 +42,6 @@ jobs:
 
       - name: Run Forge tests
         run: forge test -vvv
+
+      - name: Run Forge tests with solc (without tests.json)
+        run: forge test --use 0.8.38 --nmt test_tests --no-match-contract GasTest

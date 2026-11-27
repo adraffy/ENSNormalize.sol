@@ -14,7 +14,7 @@ The deployment is immutable and ownerless: no admin, no upgrades. A new spec is 
 
 ## Commands
 
-Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh).
+Requires [Foundry](https://getfoundry.sh) and [Bun](https://bun.sh). The compiler is [Solar](https://github.com/paradigmxyz/solar), pinned in `foundry.toml` (`solc = "solar:0.3.0"`); forge installs it. The code must also compile and pass with solc: `forge test --use 0.8.38`.
 
 ```sh
 bun install
@@ -43,8 +43,8 @@ GasTest measures the call itself (not the test's overhead), and forge treats eve
 | `scripts/nf.ts` | NFD/NFC from `nf.json` (used by make.ts) |
 | `scripts/utils.ts` | byte writer, keccak (`@adraffy/keccak`) |
 | `scripts/download.ts` | fetches the spec and tests |
-| `test/ENSNormalize.t.sol` | tests.json (sharded), examples, invalid UTF-8, constructor checks, `test_tables` |
-| `test/Lookup.t.sol` | the contract's `_lookup()` of every codepoint vs `LOOKUP_HASH` from make.ts |
+| `test/ENSNormalize.t.sol` | tests.json (sharded), examples, invalid UTF-8, constructor checks |
+| `test/Lookup.t.sol` | the contract's `_lookup()` of every codepoint vs `LOOKUP_HASH` from make.ts, and where it reads `TABLES` |
 | `test/TestsJSON.sol` | minimal JSON parser for tests.json (forge's cheatcodes coerce strings and reject lone surrogates) |
 | `test/Gas.t.sol` | gas report |
 | `snapshots/` | the gas report's output: `normalize.json`, `deploy.json` |
@@ -58,16 +58,14 @@ GasTest measures the call itself (not the test's overhead), and forge treats eve
 - **Don't edit `src/generated/`** by hand.
 - **Keep parity.** A tests.json failure is a bug. Don't skip or special-case tests; the only conversions are the ones in `test/ENSNormalize.t.sol` (names are split on `.`, `""` is `""`, lone surrogates are U+FFFD).
 - **Assumptions are asserted in make.ts** (eg. no mapped emoji start, decomposable cps aren't mapped, one ignored range above `LIMIT`, groups fit in a `uint256`). If a new spec breaks one, change the encoding and the contract, don't drop the assert.
-- **Tables in the contract's code.** `TABLES` is a literal that `tables()` returns, and the contract reads it with `CODECOPY` at `codesize() - metadata - TABLES_SIZE` (`_context()`). That works because it's the only data in the runtime code, so solc (legacy codegen) puts it right before the metadata. So:
-  - don't add another literal over 32 bytes to `ENSNormalize` (a revert string, a `bytes`/`string` constant): solc orders data by hash and the tables could move.
-  - don't enable `via_ir`: it lays out data differently (and the code gets bigger).
-  - `test_tables` checks the placement; if it fails, nothing else is trustworthy.
-- **Sizes.** `ENSNormalize` must stay under 24,576 bytes (EIP-170): `TABLES_BUDGET` in make.ts is what's left for the tables after the logic (about 7.3 KB) and the metadata. Keep a couple hundred bytes of margin, and check the `hot buckets:` line that make.ts prints: a `!` is a bucket that didn't fit. The hot buckets fill whatever the other tables leave of it, so lower it if the logic grows. Each data section must fit in one contract (24,575 bytes after the leading STOP), and a deploy transaction must stay under the EIP-7825 cap (16,777,216 gas).
+- **Tables in the contract's code.** `TABLES` is a literal that `tables()` returns (that's what puts it in the runtime code), and the contract reads it with `CODECOPY` (`_context()`). Where a compiler puts it isn't specified, so the constructor finds it (`_findTables()`): the runtime code is the end of the initcode, before the ABI-encoded arguments, so it looks back up to 2 KB from there for `TABLES_TAIL`, checks `TABLES_HASH`, and keeps the distance from the end in an immutable. If a compiler moves the literal further from the end, deploying reverts `InvalidTables()`; `test/Lookup.t.sol` checks the result.
+- **Sizes.** `ENSNormalize` must stay under 24,576 bytes (EIP-170): `TABLES_BUDGET` in make.ts is what's left for the tables after the logic and the metadata, with solc's code (about 7.3 KB; Solar's is about 6.5 KB), so both compilers fit. Keep a couple hundred bytes of margin, and check the `hot buckets:` line that make.ts prints: a `!` is a bucket that didn't fit. The hot buckets fill whatever the other tables leave of it, so lower it if the logic grows. Each data section must fit in one contract (24,575 bytes after the leading STOP), and a deploy transaction must stay under the EIP-7825 cap (16,777,216 gas).
 - **Generated constants are file-level** (not in a library), because inline assembly can only use direct number constants. A contract constant that's used in assembly must be a literal expression too (not `X = OTHER_CONSTANT`-style member access).
 - **A constant that's an expression of other constants isn't folded.** `CTX_SIZE = CTX_SCRATCH + ...` is evaluated wherever it's used, with an overflow check per `+` (about 70 gas each: `ctx + CTX_SIZE` was 350). Use those constants inside `unchecked`, where the optimizer folds them. In general, keep Solidity arithmetic on the hot paths in `unchecked` blocks.
 - **Nested `switch` is expensive in assembly:** each level costs a compare to enter and a pop to leave. The hot paths use one level of `for {} 1 {} { if ... { ... break } ... break }`.
 - **Gas:** the general path doesn't allocate: `[context][cps][entries][scratch]` are laid out from the free memory pointer, which never moves, and `normalize()` returns from assembly. Don't call anything that allocates there (only the final `revert CannotNormalize(label)` does). `_lookup()` caches the last bucket and `_maskAll()` 4 masks in the context. EVM loops cost about 3 gas per opcode and the legacy optimizer doesn't help assembly much, so count operations: an idea is worth it if it removes operations from the per-codepoint paths (`_classify`, `_lookup`, the `_tokenize` and `_isValid` loops) or avoids a data contract. Measure with GasTest and the flamegraph before keeping it. To see exactly what runs, record the opcodes of a call with `vm.startDebugTraceRecording()` (needs `-vvv`) and look for repeated patterns.
 - **EVM version:** `cancun` (no osaka opcodes), so it deploys on chains that haven't adopted osaka.
+- **Solar and solc:** check gas and size changes with both (`--use 0.8.38`): they don't optimize the same things.
 
 ## Working with the maintainer
 
