@@ -5,7 +5,8 @@
   "scripts": {
     "download": "bun scripts/download.ts",
     "make": "bun scripts/make.ts",
-    "test": "forge test"
+    "test": "forge test",
+    "labels": "bun scripts/labels.ts && FOUNDRY_PROFILE=exhaustive forge test"
   },
   "devDependencies": {
     "@adraffy/keccak": "^1.3.4"

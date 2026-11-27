@@ -43,6 +43,7 @@ forge test --mc GasTest -vv   # gas report, writes snapshots/
   The tests are split into 8 shards so forge runs them in parallel (about 45s).
 - **Every codepoint:** `test/Lookup.t.sol` hashes the contract's lookup of all 1,114,112 codepoints and compares it with the hash that `scripts/make.ts` computed from the spec.
 - **Tables:** `test/Lookup.t.sol` also checks that the tables are where the contract reads them in its own code.
+- **Every known label** (not part of `forge test` or CI): `bun run labels` runs the 3.4M labels of [adraffy/ens-labels](https://github.com/adraffy/ens-labels) through the reference implementation of ens-normalize-derive (`src/ensip15.ts`), then through the contract, and compares the outputs and errors (about 30s). `scripts/labels.ts` downloads `labels.json` (about 50 MB) and the reference's 3 source files into `data/` and writes the expected results to `data/labels/`, and `labels/Labels.t.sol` runs them in the `exhaustive` Foundry profile (`FOUNDRY_PROFILE=exhaustive forge test`), in 32 shards. It adds no dependencies.
 
 ## Gas
 
